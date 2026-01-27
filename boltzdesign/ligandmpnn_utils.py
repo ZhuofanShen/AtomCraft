@@ -2,20 +2,18 @@ import json
 import logging
 import os
 import sys
-from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, Optional
+
 import numpy as np
 import pandas as pd
-import torch
 import yaml
 from Bio.PDB import PDBIO
 from Bio.PDB.MMCIFParser import MMCIFParser
 from prody import parsePDB
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ligandmpnn_path = os.path.join(project_root, 'LigandMPNN')
+ligandmpnn_path = os.path.join(project_root, "LigandMPNN")
 
 if project_root not in sys.path:
     sys.path.append(project_root)
@@ -23,19 +21,21 @@ if ligandmpnn_path not in sys.path:
     sys.path.append(ligandmpnn_path)
 
 from run import main
+from score import main as score_main
 
 chain_to_number = {
-    'A': 0,
-    'B': 1,
-    'C': 2,
-    'D': 3,
-    'E': 4,
-    'F': 5,
-    'G': 6,
-    'H': 7,
-    'I': 8,
-    'J': 9,
+    "A": 0,
+    "B": 1,
+    "C": 2,
+    "D": 3,
+    "E": 4,
+    "F": 5,
+    "G": 6,
+    "H": 7,
+    "I": 8,
+    "J": 9,
 }
+
 
 def int_to_chain(i, base=62):
     """
@@ -44,7 +44,7 @@ def int_to_chain(i, base=62):
     """
     if i < 0:
         raise ValueError("positive integers only")
-    if base < 0 or 62 < base:
+    if base < 0 or base > 62:
         raise ValueError("Invalid base")
 
     quot = int(i) // base
@@ -61,8 +61,10 @@ def int_to_chain(i, base=62):
     else:
         return int_to_chain(quot - 1, base) + letter
 
+
 class OutOfChainsError(Exception):
     pass
+
 
 def rename_chains(structure):
     """
@@ -74,7 +76,7 @@ def rename_chains(structure):
     """
     next_chain = 0
     chainmap = {c.id: c.id for c in structure.get_chains() if len(c.id) == 1}
-    
+
     for o in structure.get_chains():
         if len(o.id) != 1:
             if o.id[0] not in chainmap:
@@ -91,6 +93,7 @@ def rename_chains(structure):
                 o.id = c
     return chainmap
 
+
 def sanitize_residue_names(structure):
     """
     Truncates all residue names to 3 characters (PDB format limit).
@@ -102,8 +105,11 @@ def sanitize_residue_names(structure):
                 resname = residue.resname
                 if len(resname) > 3:
                     truncated = resname[:3]
-                    logging.warning(f"Truncating residue name '{resname}' to '{truncated}'")
+                    logging.warning(
+                        f"Truncating residue name '{resname}' to '{truncated}'"
+                    )
                     residue.resname = truncated
+
 
 def convert_cif_to_pdb(ciffile, pdbfile):
     """
@@ -116,7 +122,7 @@ def convert_cif_to_pdb(ciffile, pdbfile):
     Returns:
         bool: True if conversion succeeds, False otherwise
     """
-    logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.WARNING)
+    logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.WARNING)
 
     strucid = ciffile[:4] if len(ciffile) > 4 else "1xxx"
 
@@ -140,10 +146,12 @@ def convert_cif_to_pdb(ciffile, pdbfile):
     io.save(pdbfile)
     return True
 
-def convert_cif_files_to_pdb(results_dir, save_dir, af_dir=False, high_iptm=False, i_ptm_cutoff = 0.5):
+
+def convert_cif_files_to_pdb(
+    results_dir, save_dir, af_dir=False, high_iptm=False, i_ptm_cutoff=0.5
+):
     """
     Convert all .cif files in results_dir to .pdb format and save in save_dir
-    
     Args:
         results_dir (str): Directory containing .cif files
         save_dir (str): Directory to save converted .pdb files
@@ -154,98 +162,124 @@ def convert_cif_files_to_pdb(results_dir, save_dir, af_dir=False, high_iptm=Fals
     for root, dirs, files in os.walk(results_dir):
         for file in files:
             if af_dir:
-                if file.endswith('_model.cif'):
+                if file.endswith("_model.cif"):
                     cif_path = os.path.join(root, file)
-                    pdb_path = os.path.join(save_dir, file.replace('.cif', '.pdb'))
+                    pdb_path = os.path.join(save_dir, file.replace(".cif", ".pdb"))
                     print(f"Converting {cif_path}")
-                    
+
                     if high_iptm:
-                        confidence_file_summary = [os.path.join(root, f) for f in os.listdir(root) if f.endswith('summary_confidences.json')][0]
-                        confidence_file = [os.path.join(root, f) for f in os.listdir(root) if f.endswith('_confidences.json') and not f.endswith('summary_confidences.json')][0]
+                        confidence_file_summary = [
+                            os.path.join(root, f)
+                            for f in os.listdir(root)
+                            if f.endswith("summary_confidences.json")
+                        ][0]
+                        confidence_file = [
+                            os.path.join(root, f)
+                            for f in os.listdir(root)
+                            if f.endswith("_confidences.json")
+                            and not f.endswith("summary_confidences.json")
+                        ][0]
                         with open(confidence_file_summary) as f:
                             confidence_data = json.load(f)
-                            iptm = confidence_data['iptm']
+                            iptm = confidence_data["iptm"]
 
-                        with open(confidence_file, 'r') as f:
+                        with open(confidence_file) as f:
                             confidence_data = json.load(f)
-                            plddt = np.mean(confidence_data['atom_plddts'])
-                            
+                            plddt = np.mean(confidence_data["atom_plddts"])
+
                         if iptm > i_ptm_cutoff:
-                            print(f"Converting {cif_path}") 
+                            print(f"Converting {cif_path}")
                             print(f"iptm score: {iptm}")
                             print(f"pdb_path: {pdb_path}")
                             convert_cif_to_pdb(cif_path, pdb_path)
-                            confidence_scores.append({'file': file, 'iptm': iptm, 'plddt': plddt})
+                            confidence_scores.append(
+                                {"file": file, "iptm": iptm, "plddt": plddt}
+                            )
 
-                    else:  
+                    else:
                         print(f"Converting {cif_path}")
                         convert_cif_to_pdb(cif_path, pdb_path)
             else:
-                if file.endswith('.cif'):
+                if file.endswith(".cif"):
                     cif_path = os.path.join(root, file)
-                    pdb_path = os.path.join(save_dir, file.replace('.cif', '.pdb'))
+                    pdb_path = os.path.join(save_dir, file.replace(".cif", ".pdb"))
                     print(f"Converting {cif_path}")
 
                     if high_iptm:
-                        confidence_files = [f for f in os.listdir(root) if f.startswith('confidence_') and f.endswith('.json')]
+                        confidence_files = [
+                            f
+                            for f in os.listdir(root)
+                            if f.startswith("confidence_") and f.endswith(".json")
+                        ]
                         if confidence_files:
                             confidence_file = os.path.join(root, confidence_files[0])
                             with open(confidence_file) as f:
                                 confidence_data = json.load(f)
-                                iptm = confidence_data['iptm']
+                                iptm = confidence_data["iptm"]
                             if iptm > i_ptm_cutoff:
                                 print(f"Converting {cif_path}")
                                 print(f"Confidence file: {confidence_file}")
                                 print(f"iptm score: {iptm}")
                                 convert_cif_to_pdb(cif_path, pdb_path)
-                        
+
                     else:
                         print(f"Converting {cif_path}")
                         convert_cif_to_pdb(cif_path, pdb_path)
-                        
+
             if confidence_scores:
-                confidence_scores_path = os.path.join(save_dir, 'high_iptm_confidence_scores.csv')
-                pd.DataFrame(confidence_scores).to_csv(confidence_scores_path, index=False)
+                confidence_scores_path = os.path.join(
+                    save_dir, "high_iptm_confidence_scores.csv"
+                )
+                pd.DataFrame(confidence_scores).to_csv(
+                    confidence_scores_path, index=False
+                )
                 print(f"Saved confidence scores to {confidence_scores_path}")
 
 
-def get_protein_ligand_interface(pdb_id, cutoff=6, non_protein_target=True, binder_chain='A', target_chain='B'):
+def get_protein_ligand_interface(
+    pdb_id, cutoff=6, non_protein_target=True, binder_chain="A", target_chain="B"
+):
     """
     Get interface residues between a protein and ligand/target from a PDB structure.
-    
+
     Args:
         pdb_id (str): Path to PDB file
         cutoff (float): Distance cutoff in Angstroms for interface residues
         non_protein_target (bool): Whether to select non-protein ligand (True) or protein target chain (False)
         binder_chain (str): Chain ID of the protein binder chain
         target_chain (str): Chain ID of the target protein chain (if non_protein_target=False)
-    
+
     Returns:
         list: Residue indices that are at the interface
     """
     # Load PDB structure
     pdb = parsePDB(pdb_id)
-    
+
     # Get binder protein coordinates
-    protein = pdb.select(f'protein and chain {binder_chain} and name CA')
+    protein = pdb.select(f"protein and chain {binder_chain} and name CA")
     protein_coords = protein.getCoords()
-    
+
     # Get ligand/target coordinates
     if non_protein_target:
-        ligand = pdb.select('not protein and not water')
+        ligand = pdb.select("not protein and not water")
     else:
-        ligand = pdb.select(f'protein and chain {target_chain} and name CA')
-        
+        ligand = pdb.select(f"protein and chain {target_chain} and name CA")
+
     ligand_coords = ligand.getCoords()
-    
+
     # Calculate pairwise distances and find interface residues
-    distances = np.sqrt(np.sum((protein_coords[:,None,:] - ligand_coords[None,:,:])**2, axis=-1))
+    distances = np.sqrt(
+        np.sum((protein_coords[:, None, :] - ligand_coords[None, :, :]) ** 2, axis=-1)
+    )
     interacting = distances < cutoff
     interface_residues = list(np.nonzero(np.sum(interacting, axis=-1))[0])
-    
+
     return interface_residues
 
-def get_protein_ligand_interface_all_atom(pdb_id, cutoff=6, non_protein_target=True, binder_chain='A', target_chains="all"):
+
+def get_protein_ligand_interface_all_atom(
+    pdb_id, cutoff=6, non_protein_target=True, binder_chain="A", target_chains="all"
+):
     print("target_chains", target_chains)
     """
     Get interface residues between a protein and ligand/target from a PDB structure.
@@ -261,50 +295,61 @@ def get_protein_ligand_interface_all_atom(pdb_id, cutoff=6, non_protein_target=T
     """
     # Load PDB structure
     pdb = parsePDB(pdb_id)
-    
+
     # Get binder protein coordinates
-    protein = pdb.select(f'protein and chain {binder_chain}')
+    protein = pdb.select(f"protein and chain {binder_chain}")
     protein_residues = set(protein.getResnums())
-    
 
     if non_protein_target:
-        ligand = pdb.select('not protein and not water')
+        ligand = pdb.select("not protein and not water")
         ligand_atoms = ligand.getCoords()
         protein_atoms = protein.getCoords()
-        
-        distances = np.sqrt(np.sum((protein_atoms[:,None,:] - ligand_atoms[None,:,:])**2, axis=-1))
+    
+        distances = np.sqrt(
+            np.sum((protein_atoms[:, None, :] - ligand_atoms[None, :, :]) ** 2, axis=-1)
+        )
         interacting = distances < cutoff
-        
+
         interface_residues = set()
         for i in range(len(protein)):
             if np.any(interacting[i]):
                 interface_residues.add(protein.getResnums()[i])
-                
+
     else:
         if target_chains == "all":
-            all_chains = set([chain.getChid() for chain in pdb.select('protein').getHierView().iterChains()])
+            all_chains = set(
+                [
+                    chain.getChid()
+                    for chain in pdb.select("protein").getHierView().iterChains()
+                ]
+            )
             target_chains = list(all_chains - {binder_chain})
             print("target_chains", target_chains)
-            
+
         interface_residues = set()
         for target_chain in target_chains:
-            ligand = pdb.select(f'protein and chain {target_chain}')
+            ligand = pdb.select(f"protein and chain {target_chain}")
             ligand_atoms = ligand.getCoords()
             protein_atoms = protein.getCoords()
-            
+
             # Calculate all atom distances
-            distances = np.sqrt(np.sum((protein_atoms[:,None,:] - ligand_atoms[None,:,:])**2, axis=-1))
+            distances = np.sqrt(
+                np.sum(
+                    (protein_atoms[:, None, :] - ligand_atoms[None, :, :]) ** 2, axis=-1
+                )
+            )
             interacting = distances < cutoff
-            
+
             # Map interacting atoms back to residues
             for i in range(len(protein)):
                 if np.any(interacting[i]):
                     interface_residues.add(protein.getResnums()[i])
-    
+
     sorted_residues = sorted(list(protein_residues))
     interface_indices = [sorted_residues.index(res) for res in interface_residues]
-    
+
     return sorted(interface_indices)
+
 
 def run_ligandmpnn_redesign(
     base_dir,
@@ -315,20 +360,21 @@ def run_ligandmpnn_redesign(
     top_k=5,
     cutoff=6,
     non_protein_target=True,
-    binder_chain='A',
-    target_chains=['B'],
+    binder_chain="A",
+    target_chains=["B"],
     fix_interface=True,
     out_dir=None,
     lmpnn_yaml_dir=None,
-    results_final_dir=None
+    results_final_dir=None,
+    boltz_model_version="boltz1",
 ):
     # Set default output directories if not provided
     if out_dir is None:
-        out_dir = os.path.join(base_dir, '01_lmpnn_redesigned_fa')
+        out_dir = os.path.join(base_dir, "01_lmpnn_redesigned_fa")
     if lmpnn_yaml_dir is None:
-        lmpnn_yaml_dir = os.path.join(base_dir, '01_lmpnn_redesigned_yaml')
+        lmpnn_yaml_dir = os.path.join(base_dir, "01_lmpnn_redesigned_yaml")
     if results_final_dir is None:
-        results_final_dir = os.path.join(base_dir, '01_lmpnn_redesigned')
+        results_final_dir = os.path.join(base_dir, "01_lmpnn_redesigned")
 
     # Create required directories
     for directory in [out_dir, lmpnn_yaml_dir, results_final_dir]:
@@ -339,17 +385,23 @@ def run_ligandmpnn_redesign(
     ligandpmpnn_redesign_score = []
 
     for pdb_path in os.listdir(pdb_dir):
-        pdb_name = pdb_path.split('.pdb')[0]
-        existing_yamls = list(Path(lmpnn_yaml_dir).glob(f'{pdb_name}_*.yaml'))
+        pdb_name = pdb_path.split(".pdb")[0]
+        existing_yamls = list(Path(lmpnn_yaml_dir).glob(f"{pdb_name}_*.yaml"))
         if existing_yamls:
             print(f"Skipping {pdb_name} as yaml files already exist")
             continue
         else:
             pdb_path = os.path.join(pdb_dir, pdb_path)
-            if pdb_path.endswith('.pdb'):
-                interface_residues= get_protein_ligand_interface_all_atom(pdb_path, cutoff=cutoff, non_protein_target=non_protein_target, binder_chain=binder_chain, target_chains=target_chains)
+            if pdb_path.endswith(".pdb"):
+                interface_residues = get_protein_ligand_interface_all_atom(
+                    pdb_path,
+                    cutoff=cutoff,
+                    non_protein_target=non_protein_target,
+                    binder_chain=binder_chain,
+                    target_chains=target_chains,
+                )
                 print("len interface_residues", len(interface_residues))
-                with open(ligandmpnn_config, 'r') as f:
+                with open(ligandmpnn_config) as f:
                     config_dict = yaml.safe_load(f)
 
                 if non_protein_target:
@@ -363,57 +415,110 @@ def run_ligandmpnn_redesign(
                 config.pdb_path = pdb_path
                 config.out_folder = out_dir
                 if fix_interface:
-                    config.fixed_residues = " ".join([f'{binder_chain}{item+1}' for item in interface_residues])
+                    config.fixed_residues = " ".join(
+                        [f"{binder_chain}{item + 1}" for item in interface_residues]
+                    )
                 config.batch_size = 16
                 config.save_stats = 0
                 config.chains_to_design = binder_chain
+            
                 output = main(config)
-                fasta_path = os.path.join(out_dir, 'seqs', f'{pdb_name}.fa')
+                fasta_path = os.path.join(out_dir, "seqs", f"{pdb_name}.fa")
                 print(fasta_path)
                 # Read the existing fa file
-                with open(fasta_path, 'r') as f:
+                with open(fasta_path) as f:
                     lines = f.readlines()
                     sequences = []
                     sequence_found = False  # Flag to check if sequence is found
                     for line in lines[2:]:
-                        if line.startswith('>'):
-                            overall_confidence = float(line.split(',')[4].split('=')[1])
-                            ligand_confidence = line.split(',')[5].split('=')[1]
-                            sequences.append((overall_confidence, ligand_confidence, ""))  # Store confidence and ligand
-                            sequence_found = True  # Set flag to true if sequence is found
-                        elif sequence_found:  # Check for the sequence line after finding confidence
-                            sequences[-1] = (sequences[-1][0], sequences[-1][1], line.strip())  # Add the corresponding sequence
-                            sequence_found = False  # Reset flag after capturing the sequence
-                top_sequences = sorted(sequences, key=lambda x: x[0], reverse=True)[:top_k]
-                for idx, (overall_confidence, ligand_confidence, sequence) in enumerate(top_sequences):
-                    matching_yamls = list(Path(yaml_dir).glob(f'{pdb_name.split("_results")[0]}*.yaml'))
+                        if line.startswith(">"):
+                            overall_confidence = float(line.split(",")[4].split("=")[1])
+                            ligand_confidence = line.split(",")[5].split("=")[1]
+                            sequences.append(
+                                (overall_confidence, ligand_confidence, "")
+                            )  # Store confidence and ligand
+                            sequence_found = (
+                                True  # Set flag to true if sequence is found
+                            )
+                        elif (
+                            sequence_found
+                        ):  # Check for the sequence line after finding confidence
+                            sequences[-1] = (
+                                sequences[-1][0],
+                                sequences[-1][1],
+                                line.strip(),
+                            )  # Add the corresponding sequence
+                            sequence_found = (
+                                False  # Reset flag after capturing the sequence
+                            )
+                top_sequences = sorted(sequences, key=lambda x: x[0], reverse=True)[
+                    :top_k
+                ]
+                for idx, (overall_confidence, ligand_confidence, sequence) in enumerate(
+                    top_sequences
+                ):
+                    matching_yamls = list(
+                        Path(yaml_dir).glob(f"{pdb_name.split('_results')[0]}*.yaml")
+                    )
                     if matching_yamls:
-                        yaml_path = str(matching_yamls[0])  # Take the first matching yaml file
-                        with open(yaml_path, 'r') as f:
+                        yaml_path = str(
+                            matching_yamls[0]
+                        )  # Take the first matching yaml file
+                        with open(yaml_path) as f:
                             yaml_data = yaml.safe_load(f)
-                    
+
                     # Remove constraints
-                    yaml_data.pop('constraints', None)
-                    
+                    yaml_data.pop("constraints", None)
+
                     if not non_protein_target:
                         binder_idx = chain_to_number[binder_chain]
-                        yaml_data['sequences'][binder_idx]['protein']['sequence'] = sequence.split(':')[chain_to_number[binder_chain]]
+                        yaml_data["sequences"][binder_idx]["protein"]["sequence"] = (
+                            sequence.split(":")[chain_to_number[binder_chain]]
+                        )
                     else:
-                        yaml_data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = sequence
+                        yaml_data["sequences"][chain_to_number[binder_chain]][
+                            "protein"
+                        ]["sequence"] = sequence
 
                     # Replace .npz with .a3m in msa paths
-                    for seq in yaml_data['sequences']:
-                        if 'protein' in seq and 'msa' in seq['protein']:
-                            msa_path = seq['protein']['msa']
-                            if isinstance(msa_path, str) and msa_path.endswith('.npz'):
-                                seq['protein']['msa'] = msa_path.replace('.npz', '.a3m')
+                    for seq in yaml_data["sequences"]:
+                        if "protein" in seq and "msa" in seq["protein"]:
+                            msa_path = seq["protein"]["msa"]
+                            if isinstance(msa_path, str) and msa_path.endswith(".npz"):
+                                seq["protein"]["msa"] = msa_path.replace(".npz", ".a3m")
 
-                    final_yaml_path = os.path.join(lmpnn_yaml_dir, f'{pdb_name}_{idx+1}.yaml')
-                    with open(final_yaml_path, 'w') as f:
+                    final_yaml_path = os.path.join(
+                        lmpnn_yaml_dir, f"{pdb_name}_{idx + 1}.yaml"
+                    )
+                    with open(final_yaml_path, "w") as f:
                         yaml.dump(yaml_data, f)
 
                     import subprocess
-                    subprocess.run([boltz_path, 'predict', str(final_yaml_path), '--out_dir', str(results_final_dir), '--write_full_pae'])
-                    print(f"Completed processing {pdb_name} for sequence {idx+1}")
 
-
+                    if boltz_model_version == "boltz1":
+                        subprocess.run(
+                            [
+                                boltz_path,
+                                "predict",
+                                str(final_yaml_path),
+                                "--out_dir",
+                                str(results_final_dir),
+                                "--model",
+                                "boltz1",
+                                "--write_full_pae",
+                            ]
+                        )
+                    elif boltz_model_version == "boltz2":
+                        subprocess.run(
+                            [
+                                boltz_path,
+                                "predict",
+                                str(final_yaml_path),
+                                "--out_dir",
+                                str(results_final_dir),
+                                "--model",
+                                "boltz2",
+                                "--write_full_pae",
+                            ]
+                        )
+                    print(f"Completed processing {pdb_name} for sequence {idx + 1}")

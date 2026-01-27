@@ -516,7 +516,7 @@ def parse_PDB(
     device: str = "cpu",
     chains: list = [],
     parse_all_atoms: bool = False,
-    parse_atoms_with_zero_occupancy: bool = False
+    parse_atoms_with_zero_occupancy: bool = False,
 ):
     """
     input_path : path for the input PDB
@@ -784,9 +784,11 @@ def parse_PDB(
             str_out += " chain " + item + " or"
         atoms = atoms.select(str_out[1:-3])
 
-    protein_atoms = atoms.select("protein")
-    backbone = protein_atoms.select("backbone")
-    other_atoms = atoms.select("not protein and not water")
+    # protein_atoms = atoms.select("protein")
+    protein_atoms = atoms.select("protein or resname UNK")
+    # backbone = protein_atoms.select("backbone")
+    backbone = protein_atoms.select("backbone or (resname UNK and name N CA C O)")
+    other_atoms = atoms.select("not protein and not resname UNK and not water")
     water_atoms = atoms.select("water")
 
     CA_atoms = protein_atoms.select("name CA")
@@ -827,6 +829,7 @@ def parse_PDB(
     R_idx = np.array(CA_resnums, dtype=np.int32)
     S = CA_atoms.getResnames()
     S = [restype_3to1[AA] if AA in list(restype_3to1) else "X" for AA in list(S)]
+
     S = np.array([restype_STRtoINT[AA] for AA in list(S)], np.int32)
     X = np.concatenate([N[:, None], CA[:, None], C[:, None], O[:, None]], 1)
 

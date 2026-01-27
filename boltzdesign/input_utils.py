@@ -1,24 +1,21 @@
-import os
 import logging
-import warnings
+import os
 from pathlib import Path
-from io import StringIO
+
+import pypdb
 import requests
 import yaml
-import pandas as pd
-import pypdb
-from prody import *
-from rdkit import Chem
-from rdkit.Chem import AllChem
 from Bio.PDB import PDBParser
+from Bio.PDB.MMCIFParser import MMCIFParser
+from prody import *
+from prody import parsePDB
+
 from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.parse.a3m import parse_a3m
-from prody import parsePDB
 
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -27,27 +24,34 @@ class Config:
     def __init__(self, main_dir: str = None):
         self.CUDA_DEVICE = "1"
         if main_dir is None:
-            self.MAIN_DIR = Path.cwd() / 'inputs'
+            self.MAIN_DIR = Path.cwd() / "inputs"
         else:
             self.MAIN_DIR = Path(main_dir)
-        self.PDB_DIR = self.MAIN_DIR / 'PDB'
-        self.MSA_DIR = self.MAIN_DIR / 'MSA'
-        self.YAML_DIR = self.MAIN_DIR / 'yaml'
-        self.DESIGN_DIR = self.MAIN_DIR / 'designs'
+        self.PDB_DIR = self.MAIN_DIR / "PDB"
+        self.MSA_DIR = self.MAIN_DIR / "MSA"
+        self.YAML_DIR = self.MAIN_DIR / "yaml"
+        self.DESIGN_DIR = self.MAIN_DIR / "designs"
 
     def setup_directories(self):
         """Create necessary directories if they don't exist."""
-        for directory in [self.MAIN_DIR, self.PDB_DIR, self.MSA_DIR, self.YAML_DIR, self.DESIGN_DIR]:
+        for directory in [
+            self.MAIN_DIR,
+            self.PDB_DIR,
+            self.MSA_DIR,
+            self.YAML_DIR,
+            self.DESIGN_DIR,
+        ]:
             directory.mkdir(parents=True, exist_ok=True)
+
 
 # Utility functions
 def download_pdb(pdb_code: str, save_path: Path) -> bool:
     """Download PDB file from RCSB.
-    
+
     Args:
         pdb_code: PDB identifier
         save_path: Directory to save the PDB file
-        
+
     Returns:
         bool: True if download was successful, False otherwise
     """
@@ -55,7 +59,7 @@ def download_pdb(pdb_code: str, save_path: Path) -> bool:
     try:
         response = requests.get(url)
         response.raise_for_status()
-        
+
         file_path = save_path / f"{pdb_code}.pdb"
         file_path.write_text(response.text)
         logger.info(f"PDB file {pdb_code}.pdb downloaded successfully!")
@@ -64,47 +68,110 @@ def download_pdb(pdb_code: str, save_path: Path) -> bool:
         logger.error(f"Failed to download {pdb_code}.pdb: {str(e)}")
         return False
 
-def get_chains_sequence(pdb_path: Path) -> dict:
-    """Extract protein sequences from PDB file.
-    
+
+def download_cif(pdb_code: str, save_path: Path) -> bool:
+    """Download mmCIF file from RCSB.
+
     Args:
-        pdb_path: Path to PDB file
-        
+        pdb_code: PDB identifier
+        save_path: Directory to save the mmCIF file
+
+    Returns:
+        bool: True if download was successful, False otherwise
+    """
+    url = f"https://files.rcsb.org/download/{pdb_code}.cif"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+
+        file_path = save_path / f"{pdb_code}.cif"
+        file_path.write_text(response.text)
+        logger.info(f"mmCIF file {pdb_code}.cif downloaded successfully!")
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Failed to download {pdb_code}.cif: {str(e)}")
+        return False
+
+
+def get_chains_sequence(pdb_path: Path) -> dict:
+    """Extract protein sequences from PDB/mmCIF file.
+
+    Args:
+        pdb_path: Path to PDB or mmCIF file
+
     Returns:
         dict: Dictionary mapping chain IDs to sequences
     """
     aa_dict = {
-        'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
-        'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
-        'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
-        'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
+        "ALA": "A",
+        "CYS": "C",
+        "ASP": "D",
+        "GLU": "E",
+        "PHE": "F",
+        "GLY": "G",
+        "HIS": "H",
+        "ILE": "I",
+        "LYS": "K",
+        "LEU": "L",
+        "MET": "M",
+        "ASN": "N",
+        "PRO": "P",
+        "GLN": "Q",
+        "ARG": "R",
+        "SER": "S",
+        "THR": "T",
+        "VAL": "V",
+        "TRP": "W",
+        "TYR": "Y",
     }
-    
+
     chain_sequences = {}
     prev_res_nums = {}
-    
+
     try:
-        with open(pdb_path, 'r') as f:
-            for line in f:
-                if line.startswith('ATOM'):
-                    chain_id = line[21]
-                    res_name = line[17:20].strip()
-                    res_num = line[22:26].strip()
-                    
-                    if res_name not in aa_dict:
-                        continue
-                    
+        if pdb_path.suffix == ".cif":
+            # Use Bio.PDB's MMCIFParser for CIF files
+            parser = MMCIFParser()
+            structure = parser.get_structure("structure", str(pdb_path))
+
+            for model in structure:
+                for chain in model:
+                    chain_id = chain.id
                     if chain_id not in chain_sequences:
                         chain_sequences[chain_id] = []
                         prev_res_nums[chain_id] = None
-                    
-                    if res_num != prev_res_nums[chain_id]:
-                        chain_sequences[chain_id].append(aa_dict[res_name])
-                        prev_res_nums[chain_id] = res_num
-        
-        return {chain: ''.join(seq) for chain, seq in chain_sequences.items()}
+
+                    for residue in chain:
+                        if residue.get_resname() in aa_dict:
+                            res_num = str(residue.get_id()[1])
+                            if res_num != prev_res_nums[chain_id]:
+                                chain_sequences[chain_id].append(
+                                    aa_dict[residue.get_resname()]
+                                )
+                                prev_res_nums[chain_id] = res_num
+
+        else:  # PDB format
+            with open(pdb_path) as f:
+                for line in f:
+                    if line.startswith("ATOM"):
+                        chain_id = line[21]
+                        res_name = line[17:20].strip()
+                        res_num = line[22:26].strip()
+
+                        if res_name not in aa_dict:
+                            continue
+
+                        if chain_id not in chain_sequences:
+                            chain_sequences[chain_id] = []
+                            prev_res_nums[chain_id] = None
+
+                        if res_num != prev_res_nums[chain_id]:
+                            chain_sequences[chain_id].append(aa_dict[res_name])
+                            prev_res_nums[chain_id] = res_num
+
+        return {chain: "".join(seq) for chain, seq in chain_sequences.items()}
     except Exception as e:
-        logger.error(f"Error processing PDB file {pdb_path}: {str(e)}")
+        logger.error(f"Error processing file {pdb_path}: {str(e)}")
         return {}
 
 
@@ -115,9 +182,10 @@ def get_pdb_components(pdb_id):
     :return:
     """
     pdb = parsePDB(pdb_id)
-    protein = pdb.select('protein')
-    ligand = pdb.select('not protein and not water')
+    protein = pdb.select("protein")
+    ligand = pdb.select("not protein and not water")
     return protein, ligand
+
 
 def get_ligand_smiles(ligand, res_name):
     """
@@ -128,83 +196,119 @@ def get_ligand_smiles(ligand, res_name):
     """
     sub_mol = ligand.select(f"resname {res_name}")
     chem_desc = pypdb.describe_chemical(f"{res_name}")
-    
+
     # Extract SMILES from chemical description
     smiles = None
-    for item in chem_desc.get('pdbx_chem_comp_descriptor', []):
-        if item.get('type') == 'SMILES':
-            smiles = item.get('descriptor')
+    for item in chem_desc.get("pdbx_chem_comp_descriptor", []):
+        if item.get("type") == "SMILES":
+            smiles = item.get("descriptor")
             break
-            
+
     return smiles
 
-def get_ligand_from_pdb(pdb_name):
+
+def get_ligand_from_pdb(input_name):
     """
-    Get dictionary mapping ligand names to their SMILES strings from a PDB file
-    :param pdb_name: id from the pdb, doesn't need to have an extension
+    Get dictionary mapping ligand names to their SMILES strings from a PDB/CIF file
+    :param input_name: id from the pdb/cif, doesn't need to have an extension
     :return: dict mapping ligand residue names to SMILES strings
     """
     # Common ions and small molecules to ignore
-    IGNORE_LIST = {'HOH', 'H2O', 'NA', 'CA', 'MG', 'CL', 'SO4', 'PO4', 'K', 'ZN', 'CU', 'FE', 'MN',
-                   'NI', 'CO', 'CD', 'GOL', 'PEG', 'EDO', 'DMS', 'ACT', 'FMT', 'MES', 'HEM', 'TRS',
-                   'ACE', 'BME', 'PGE', 'MPD', 'TLA', 'EOH', 'IPA', 'PCA', 'PG4', 'DTT', 'IMD'}
-    
-    _, ligand = get_pdb_components(pdb_name)
+    IGNORE_LIST = {
+        "HOH",
+        "H2O",
+        "NA",
+        "CA",
+        "MG",
+        "CL",
+        "SO4",
+        "PO4",
+        "K",
+        "ZN",
+        "CU",
+        "FE",
+        "MN",
+        "NI",
+        "CO",
+        "CD",
+        "GOL",
+        "PEG",
+        "EDO",
+        "DMS",
+        "ACT",
+        "FMT",
+        "MES",
+        "HEM",
+        "TRS",
+        "ACE",
+        "BME",
+        "PGE",
+        "MPD",
+        "TLA",
+        "EOH",
+        "IPA",
+        "PCA",
+        "PG4",
+        "DTT",
+        "IMD",
+    }
+
+    _, ligand = get_pdb_components(input_name)
     res_name_list = list(set(ligand.getResnames()) - IGNORE_LIST)
-    
+
     # If no valid ligands found
     if not res_name_list:
         return {}
-    
+
     # Create dictionary mapping ligand names to SMILES strings
     ligand_dict = {}
     for res in res_name_list:
         smiles = get_ligand_smiles(ligand, res)
         if smiles:
             ligand_dict[res] = smiles
-            
+
     return ligand_dict
+
 
 def get_nucleotide_from_pdb(pdb_path):
     """Extract nucleotide sequence from PDB file"""
     parser = PDBParser(QUIET=True)  # Suppress PDB warnings
-    pdb_code = os.path.basename(pdb_path).split('.')[0]
+    pdb_code = os.path.basename(pdb_path).split(".")[0]
     structure = parser.get_structure(pdb_code, pdb_path)
-    
+
     sequences = {}
     for chain in structure.get_chains():
         seq = ""
         is_dna = False
         for residue in chain:
             resname = residue.get_resname()
-            if resname in ['DA', 'DT', 'DC', 'DG']:  # DNA nucleotides
+            if resname in ["DA", "DT", "DC", "DG"]:  # DNA nucleotides
                 is_dna = True
                 seq += resname[1]  # Remove the 'D' prefix
-            elif resname in ['A', 'U', 'C', 'G']:  # RNA nucleotides
+            elif resname in ["A", "U", "C", "G"]:  # RNA nucleotides
                 seq += resname
         if seq:
-            sequences[chain.id] = {'seq': seq, 'is_dna': is_dna}
-            
+            sequences[chain.id] = {"seq": seq, "is_dna": is_dna}
+
     return sequences
+
 
 def process_modifications(modifications: str, modifications_positions: str):
     """Process modifications data"""
     if modifications and modifications_positions:
-        mod_list = [mod.strip() for mod in modifications.split(',')]
-        pos_list = [int(pos.strip()) for pos in modifications_positions.split(',')]
-        
+        mod_list = [mod.strip() for mod in modifications.split(",")]
+        pos_list = [int(pos.strip()) for pos in modifications_positions.split(",")]
+
         if len(mod_list) != len(pos_list):
             raise ValueError("Number of modifications and positions must match.")
-        
+
         modifications_data = []
         for mod, pos in zip(mod_list, pos_list):
-            modifications_data.append({
-                'position': pos,
-                'ccd': mod
-            })
+            modifications_data.append({"position": pos, "ccd": mod})
     else:
         modifications_data = None
     return modifications_data
+
 
 def setup_constraints(contact_residues: str, binder_id: str, target_id: str):
     """Setup binding constraints"""
@@ -212,49 +316,87 @@ def setup_constraints(contact_residues: str, binder_id: str, target_id: str):
     if contact_residues:
         residues = [int(x.strip()) for x in contact_residues.split(",")]
         constraints = {
-            'pocket': {
-                'binder': binder_id,
-                'contacts': [[target_id, res] for res in residues]
+            "pocket": {
+                "binder": binder_id,
+                "contacts": [[target_id, res] for res in residues],
             }
         }
     return constraints
 
-def process_design_constraints(target_id_map: dict, modifications: str, modifications_positions: str, modification_target: str, contact_residues: str, constraint_target: str, binder_id: str):
+
+def process_design_constraints(
+    target_id_map: dict,
+    modifications: str,
+    modifications_positions: str,
+    modification_target: str,
+    contact_residues: str,
+    constraint_target: str,
+    binder_id: str,
+):
     """Process design constraints and modifications"""
     if not (contact_residues or modifications):
         return None, None
-        
-    constraint_target = target_id_map.get(constraint_target, '') if contact_residues else ''
-    modification_target = target_id_map.get(modification_target, '') if modifications else ''
- 
+
+    constraint_target = (
+        target_id_map.get(constraint_target, "") if contact_residues else ""
+    )
+    modification_target = (
+        target_id_map.get(modification_target, "") if modifications else ""
+    )
+
     modifications = {
-        'data': process_modifications(modifications, modifications_positions),
-        'target': modification_target
+        "data": process_modifications(modifications, modifications_positions),
+        "target": modification_target,
     }
     constraints = setup_constraints(contact_residues, binder_id, constraint_target)
-    
+
     return constraints, modifications
-    
-def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None) -> dict:
+
+
+def build_chain_dict(
+    targets: list,
+    target_type: str,
+    binder_id: str,
+    constraints: dict = None,
+    modifications: dict = None,
+    modification_target: str = None,
+    cyclic: bool = False,
+    motif_scaffolding: bool = False,
+    smiles: bool = True,
+) -> dict:
     # Build chain dictionary
-    chain_dict = {binder_id: {'type': 'protein', 'sequence': 'X' * 100}}
+
+    if not motif_scaffolding:
+        if cyclic:
+            chain_dict = {
+                binder_id: {"type": "protein", "sequence": "X" * 100, "cyclic": "true"}
+            }
+        else:
+            chain_dict = {binder_id: {"type": "protein", "sequence": "X" * 100}}
+    if motif_scaffolding:
+        chain_dict = {binder_id: {"type": "protein", "sequence": targets[0]}}
+        targets = targets[1:]
     # Map target types to their YAML representation
     type_map = {
-        'protein': {'type': 'protein', 'sequence': True, 'msa': 'empty'},
-        'small_molecule': {'type': 'ligand', 'smiles': True},
-        'metal': {'type': 'ligand', 'ccd': True},
-        'dna': {'type': 'dna', 'sequence': True},
-        'rna': {'type': 'rna', 'sequence': True}
+        "protein": {"type": "protein", "sequence": True, "msa": "empty"},
+        "peptide": {"type": "protein", "sequence": True, "msa": "empty"},
+        "small_molecule": {"type": "ligand", "smiles": True} if smiles else {"type": "ligand", "ccd": True},
+        "metal": {"type": "ligand", "ccd": True},
+        "dna": {"type": "dna", "sequence": True},
+        "rna": {"type": "rna", "sequence": True},
     }
     yaml_target_ids = []
-    
+
     for i, target in enumerate(targets):
         # Get letters in order, removing binder_id
-        available_letters = ''.join(c for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' if c != binder_id)
+
+        available_letters = "".join(
+            c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if c != binder_id
+        )
         target_id = available_letters[i]
-        
+
         yaml_target_ids.append(target_id)
-        target_info = {'id': target_id}
+        target_info = {"id": target_id}
         type_info = type_map[target_type]
 
         # Add appropriate fields based on target type
@@ -263,15 +405,29 @@ def build_chain_dict(targets: list, target_type: str, binder_id: str, constraint
                 target_info[field] = target
             elif value:
                 target_info[field] = value
-                
+
         chain_dict[target_id] = target_info
-        
     return chain_dict, yaml_target_ids
 
-def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False) -> dict:
+
+def generate_yaml_for_target_binder(
+    name: str,
+    target_type: str,
+    targets: list,
+    config="",
+    binder_id="A",
+    constraints: dict = None,
+    modifications: dict = None,
+    modification_target: str = None,
+    use_msa: bool = False,
+    template_path: str = None,
+    cyclic: bool = False,
+    motif_scaffolding: bool = False,
+    smiles: bool = True
+) -> dict:
     """
     Generate YAML content for a small molecule binder with multiple targets and create the YAML file.
-    
+
     Args:
         name (str): Name/PDB code for the target
         type (str): Type of ligand ('small_molecule', 'dna', 'rna', 'metal', 'protein')
@@ -282,75 +438,104 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
         modifications (dict): Optional modifications to add to YAML
         modification_target (str): Optional modification target to add to YAML
         use_msa (bool): Whether to use MSA for proteins
-        
+
     Returns:
         tuple: YAML content dictionary and output path
-    """ 
+    """
 
-    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target)
+    chain_dict, yaml_target_ids = build_chain_dict(
+        targets,
+        target_type,
+        binder_id,
+        constraints,
+        modifications,
+        modification_target,
+        cyclic,
+        motif_scaffolding,
+        smiles,
+    )
     # Build sequences list for YAML
     sequences = []
+    template_chain_ids = []
     for chain_id, info in chain_dict.items():
-        if not isinstance(info, dict) or 'type' not in info:
+        if not isinstance(info, dict) or "type" not in info:
             continue
-            
+
         entry = {}
-        if info['type'] == 'ligand':
-            key = 'smiles' if 'smiles' in info else 'ccd'
-            entry = {
-                "ligand": {
-                    "id": [chain_id],
-                    key: info[key]
-                }
-            }
-        elif info['type'] in ['dna', 'rna']:
-            entry = {
-                info['type']: {
-                    "id": [chain_id],
-                    "sequence": info['sequence']
-                }
-            }
+        if info["type"] == "ligand":
+            key = "smiles" if "smiles" in info else "ccd"
+            entry = {"ligand": {"id": [chain_id], key: info[key]}}
+        elif info["type"] in ["dna", "rna"]:
+            entry = {info["type"]: {"id": [chain_id], "sequence": info["sequence"]}}
+            if template_path:
+                template_chain_ids.append(chain_id)
         else:  # protein
-            msa_path = (config.MSA_DIR / f"{name}_{chain_id}_env/msa.npz" 
-                       if use_msa and not all(x == 'X' for x in info['sequence']) 
-                       else "empty")
+            msa_path = (
+                config.MSA_DIR / f"{name}_{chain_id}_env/msa.npz"
+                if use_msa and not all(x == "X" for x in info["sequence"])
+                else "empty"
+            )
 
             if msa_path != "empty":
-                process_msa(chain_id, info['sequence'], name, config)
+                process_msa(chain_id, info["sequence"], name, config.MSA_DIR)
                 print(f"Processed MSA for {name} chain {chain_id}")
-            
+
             entry = {
                 "protein": {
                     "id": [chain_id],
-                    "sequence": info['sequence'],
-                    "msa": str(msa_path)
+                    "sequence": info["sequence"],
+                    "msa": str(msa_path),
                 }
             }
-            
-            if modifications and chain_id in yaml_target_ids and chain_id == modification_target:
+
+            if "cyclic" in info:
+                entry["protein"]["cyclic"] = info["cyclic"]
+
+            if (
+                modifications
+                and chain_id in yaml_target_ids
+                and chain_id == modification_target
+            ):
                 entry["protein"]["modifications"] = modifications
-                
+
+            if template_path:
+                if motif_scaffolding:
+                    template_chain_ids.append(chain_id)
+                else:
+                    if chain_id != binder_id:
+                        template_chain_ids.append(chain_id)
+
         sequences.append(entry)
-    
+
     # Create and write YAML content
     yaml_content = {"version": 1, "sequences": sequences}
     if constraints:
         yaml_content["constraints"] = [constraints]
 
+    if template_path:
+        templates = []
+        if template_path.endswith(".cif"):
+            for chain_id in template_chain_ids:
+                templates.append({"cif": str(template_path), "chain_id": chain_id})
+        elif template_path.endswith(".pdb"):
+            for chain_id in template_chain_ids:
+                templates.append({"pdb": str(template_path), "chain_id": chain_id})
+        yaml_content["templates"] = templates
+
     output_path = config.YAML_DIR / f"{name}.yaml"
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         yaml.dump(yaml_content, f, default_flow_style=False, sort_keys=False)
     logger.info(f"Created YAML file for {name}")
-    
+    print("yaml_content", yaml_content)
     return yaml_content, output_path
 
-    
-def process_msa(chain_id: str, sequence: str, pdb_code: str, config: Config) -> bool:
+
+def process_msa(chain_id: str, sequence: str, pdb_code: str, msa_dir: Path) -> bool:
     """Process MSA for a single chain."""
-    msa_chain_dir = config.MSA_DIR / f"{pdb_code}_{chain_id}"
+    msa_chain_dir = msa_dir / f"{pdb_code}_{chain_id}"
     env_dir = msa_chain_dir.with_name(f"{msa_chain_dir.name}_env")
     env_dir.mkdir(exist_ok=True)
-    
+
     # Run MSA
     unpaired_msa = run_mmseqs2(
         [sequence],
@@ -358,13 +543,13 @@ def process_msa(chain_id: str, sequence: str, pdb_code: str, config: Config) -> 
         use_env=True,
         use_pairing=False,
         host_url="https://api.colabfold.com",
-        pairing_strategy="greedy"
+        pairing_strategy="greedy",
     )
-    
+
     # Save MSA results
     msa_a3m_path = env_dir / "msa.a3m"
     msa_a3m_path.write_text(unpaired_msa[0])
-    
+
     # Process MSA if not already processed
     msa_npz_path = env_dir / "msa.npz"
     if not msa_npz_path.exists():
@@ -374,6 +559,6 @@ def process_msa(chain_id: str, sequence: str, pdb_code: str, config: Config) -> 
             max_seqs=4096,
         )
         msa.dump(msa_npz_path)
-    
+
     logger.info(f"Processed MSA for {pdb_code} chain {chain_id}")
-    return True
+    return msa_a3m_path

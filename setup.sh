@@ -16,9 +16,9 @@ source $(conda info --base)/etc/profile.d/conda.sh
 conda activate boltz_design
 
 # Install boltz
-if [ -d "boltz" ]; then
+if [ -d "boltz2" ]; then
     echo "📂 Installing Boltz..."
-    cd boltz
+    cd boltz2
     pip install -e .
     cd ..
 else
@@ -41,11 +41,11 @@ python -c 'import pyrosetta_installer; pyrosetta_installer.install_pyrosetta()'
 # Download Boltz weights and dependencies
 echo "⬇️  Downloading Boltz weights and dependencies..."
 python -c "
-from boltz.main import download
+from boltz2.main import download_boltz2
 from pathlib import Path
-cache = Path('~/.boltz').expanduser()
+cache = Path('~/.boltz2').expanduser()
 cache.mkdir(parents=True, exist_ok=True)
-download(cache)
+download_boltz2(cache)
 print('✅ Boltz weights downloaded successfully!')
 "
 
@@ -62,6 +62,6 @@ chmod +x "boltzdesign/DAlphaBall.gcc" || { echo -e "Error: Failed to chmod DAlph
 
 # Setup Jupyter kernel for the environment
 echo "📓 Setting up Jupyter kernel..."
-python -m ipykernel install --user --name=boltz_design --display-name="Boltz Design"
+python -m ipykernel install --user --name=boltz_design --display-name="Boltz Design 2"
 
 echo "🎉 Installation complete! Activate environment with: conda activate boltz_design"
