@@ -21,7 +21,7 @@ msa_max_seqs: 4096
 non_protein_target: false
 num_inter_contacts: 2
 num_intra_contacts: 2
-optimize_contact_per_binder_pos: true
+optimize_contact_per_binder_pos: false
 optimizer_type: SGD
 pocket_conditioning: true
 pre_iteration: 30
@@ -31,6 +31,5 @@ soft_iteration: 80
 soft_iteration_1: 50
 soft_iteration_2: 50
 temp_iteration: 45
-use_temp: true
-recycling_steps: 1
-noise_scaling: 0.1
+recycling_steps: 0
+motif_scaffolding: False

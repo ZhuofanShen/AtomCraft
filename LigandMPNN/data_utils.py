@@ -784,9 +784,7 @@ def parse_PDB(
             str_out += " chain " + item + " or"
         atoms = atoms.select(str_out[1:-3])
 
-    # protein_atoms = atoms.select("protein")
     protein_atoms = atoms.select("protein or resname UNK")
-    # backbone = protein_atoms.select("backbone")
     backbone = protein_atoms.select("backbone or (resname UNK and name N CA C O)")
     other_atoms = atoms.select("not protein and not resname UNK and not water")
     water_atoms = atoms.select("water")

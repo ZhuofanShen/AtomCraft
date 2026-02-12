@@ -3,10 +3,12 @@ bias_AA: ''
 bias_AA_per_residue: ''
 bias_AA_per_residue_multi: ''
 chains_to_design: null
-checkpoint_global_label_membrane_mpnn: /home/jupyter-yehlin/Pairformer/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt
-checkpoint_ligand_mpnn: /home/jupyter-yehlin/Pairformer/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt
-checkpoint_protein_mpnn: /home/jupyter-yehlin/Pairformer/LigandMPNN/model_params/proteinmpnn_v_48_020.pt
-checkpoint_soluble_mpnn: /home/jupyter-yehlin/Pairformer/LigandMPNN/model_params/solublempnn_v_48_020.pt
+
+checkpoint_protein_mpnn: "${CWD}/LigandMPNN/model_params/proteinmpnn_v_48_020.pt"
+checkpoint_ligand_mpnn: "${CWD}/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt"
+checkpoint_global_label_membrane_mpnn: "${CWD}/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt"
+checkpoint_soluble_mpnn: "${CWD}/LigandMPNN/model_params/solublempnn_v_48_020.pt"
+
 fasta_seq_separation: ':'
 file_ending: ''
 fixed_residues: ''

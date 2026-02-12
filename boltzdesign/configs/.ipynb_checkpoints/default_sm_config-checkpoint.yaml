@@ -19,8 +19,8 @@ length_min: 130
 mask_ligand: True
 msa_max_seqs: 4096
 non_protein_target: true
-num_inter_contacts: 2
-num_intra_contacts: 4
+num_inter_contacts: 1
+num_intra_contacts: 2
 optimize_contact_per_binder_pos: false
 optimizer_type: SGD
 pocket_conditioning: true
@@ -33,3 +33,4 @@ soft_iteration_2: 50
 temp_iteration: 45
 use_temp: True
 recycling_steps: 0
+noise_scaling: 0.1
