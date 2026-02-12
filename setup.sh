@@ -41,11 +41,12 @@ python -c 'import pyrosetta_installer; pyrosetta_installer.install_pyrosetta()'
 # Download Boltz weights and dependencies
 echo "⬇️  Downloading Boltz weights and dependencies..."
 python -c "
-from boltz2.main import download_boltz2
+from boltz.main import download_boltz2, download_boltz1
 from pathlib import Path
-cache = Path('~/.boltz2').expanduser()
+cache = Path('~/.boltz').expanduser()
 cache.mkdir(parents=True, exist_ok=True)
 download_boltz2(cache)
+download_boltz1(cache)
 print('✅ Boltz weights downloaded successfully!')
 "
 
