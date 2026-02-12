@@ -636,10 +636,10 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         "rg_loss": args.rg_loss,
     }
 
-    boltz_path = shutil.which("boltz2")
+    boltz_path = shutil.which("boltz")
     if boltz_path is None:
         raise FileNotFoundError(
-            "The 'boltz2' command was not found in the system PATH."
+            "The 'boltz' command was not found in the system PATH."
         )
 
     run_boltz_design(
