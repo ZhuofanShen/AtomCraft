@@ -705,7 +705,7 @@ def run_ligandmpnn_step(
     run_ligandmpnn_redesign(
         ligandmpnn_dir,
         pdb_save_dir,
-        shutil.which("boltz2"),
+        shutil.which("boltz"),
         os.path.dirname(yaml_dir),
         yaml_path,
         top_k=args.num_designs,
