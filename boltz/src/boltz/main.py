@@ -55,6 +55,8 @@ class BoltzDiffusionParams:
     alignment_reverse_diff: bool = True
     synchronize_sigmas: bool = True
     use_inference_model_cache: bool = True
+    use_heun: bool = False
+    deterministic_sampler: bool = False
 
 
 @rank_zero_only
@@ -480,8 +482,17 @@ def cli() -> None:
     "--step_scale",
     type=float,
     help="The step size is related to the temperature at which the diffusion process samples the distribution."
-    "The lower the higher the diversity among samples (recommended between 1 and 2). Default is 1.638.",
+    "The lower the higher the diversity among samples (recommended between 1 and 2). Default is 1.638. "
+    "Set to 1.0 for the velocity-consistent ODE step that enables few-step inference.",
     default=1.638,
+)
+@click.option(
+    "--gamma_0",
+    type=float,
+    help="EDM churn level. The default schedule injects noise at high sigma; set to 0.0 to "
+    "turn the sampler into a noise-free ODE sampler (pairs with --step_scale 1.0 for "
+    "stable few-step inference). Default is 0.605.",
+    default=0.605,
 )
 @click.option(
     "--write_full_pae",
@@ -543,6 +554,22 @@ def cli() -> None:
     is_flag=True,
     help="Whether to use cyclic predictions. Default is False.",
 )
+@click.option(
+    "--use_heun",
+    type=bool,
+    is_flag=True,
+    help="Whether to use Heun's second-order corrector in the diffusion sampler. "
+    "Doubles NFE per step but improves trajectory accuracy. Default is False.",
+)
+@click.option(
+    "--deterministic_sampler",
+    type=bool,
+    is_flag=True,
+    help="Make the reverse diffusion sampler deterministic: disable per-step "
+    "random augmentation (keep centering), skip the Kabsch/SVD alignment, and "
+    "zero the EDM churn noise. Lowers structural fidelity but gives a smooth, "
+    "SVD-free sequence->coords map for backprop. Default is False.",
+)
 
 
 def predict(
@@ -556,6 +583,7 @@ def predict(
     sampling_steps: int = 200,
     diffusion_samples: int = 1,
     step_scale: float = 1.638,
+    gamma_0: float = 0.605,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -566,6 +594,8 @@ def predict(
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
     cyclic: bool = False,
+    use_heun: bool = False,
+    deterministic_sampler: bool = False,
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -662,6 +692,9 @@ def predict(
     }
     diffusion_params = BoltzDiffusionParams()
     diffusion_params.step_scale = step_scale
+    diffusion_params.gamma_0 = gamma_0
+    diffusion_params.use_heun = use_heun
+    diffusion_params.deterministic_sampler = deterministic_sampler
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
         strict=True,

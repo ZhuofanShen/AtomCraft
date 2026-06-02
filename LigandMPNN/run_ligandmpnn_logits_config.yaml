@@ -1,56 +1,39 @@
-# Model configuration
-model_type: "protein_mpnn"  # Choose from: protein_mpnn, ligand_mpnn, per_residue_label_membrane_mpnn, global_label_membrane_mpnn, soluble_mpnn
-checkpoint_protein_mpnn: "${CWD}/LigandMPNN/model_params/proteinmpnn_v_48_020.pt"
-checkpoint_ligand_mpnn: "${CWD}/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt"
-checkpoint_global_label_membrane_mpnn: "${CWD}/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt"
-checkpoint_soluble_mpnn: "${CWD}/LigandMPNN/model_params/solublempnn_v_48_020.pt"
-
-# Input/Output configuration
-fasta_seq_separation: ":"
-verbose: 1
-pdb_path: ""
-pdb_path_multi: ""
-out_folder: ""
-file_ending: ""
-zero_indexed: 0
-save_stats: 0
-
-# Residue configuration
-fixed_residues: ""
-fixed_residues_multi: ""
-redesigned_residues: ""
-redesigned_residues_multi: ""
-
-# Amino acid bias configuration
-bias_AA: ""
-bias_AA_per_residue: ""
-bias_AA_per_residue_multi: ""
-omit_AA: ""
-omit_AA_per_residue: ""
-omit_AA_per_residue_multi: ""
-
-# Symmetry configuration
-symmetry_residues: ""
-symmetry_weights: ""
-homo_oligomer: 0
-
-# Generation parameters
-seed: 0
 batch_size: 1
-number_of_batches: 1
-temperature: 0.1
-
-# Ligand MPNN specific
-ligand_mpnn_use_atom_context: 1
-ligand_mpnn_cutoff_for_score: 8.0
-ligand_mpnn_use_side_chain_context: 0
+bias_AA: ''
+bias_AA_per_residue: ''
+bias_AA_per_residue_multi: ''
 chains_to_design: null
-parse_these_chains_only: ""
-
-# Transmembrane configuration
-transmembrane_buried: ""
-transmembrane_interface: ""
+checkpoint_global_label_membrane_mpnn: /opt/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt
+checkpoint_ligand_mpnn: /opt/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt
+checkpoint_protein_mpnn: /opt/LigandMPNN/model_params/proteinmpnn_v_48_020.pt
+checkpoint_soluble_mpnn: /opt/LigandMPNN/model_params/solublempnn_v_48_020.pt
+fasta_seq_separation: ':'
+file_ending: ''
+fixed_residues: ''
+fixed_residues_multi: ''
 global_transmembrane_label: 0
-
-# Parsing configuration
+homo_oligomer: 0
+ligand_mpnn_cutoff_for_score: 8.0
+ligand_mpnn_use_atom_context: 1
+ligand_mpnn_use_side_chain_context: 0
+model_type: protein_mpnn
+number_of_batches: 1
+omit_AA: ''
+omit_AA_per_residue: ''
+omit_AA_per_residue_multi: ''
+out_folder: ''
 parse_atoms_with_zero_occupancy: 0
+parse_these_chains_only: ''
+pdb_path: ''
+pdb_path_multi: ''
+redesigned_residues: ''
+redesigned_residues_multi: ''
+save_stats: 0
+seed: 0
+symmetry_residues: ''
+symmetry_weights: ''
+temperature: 0.1
+transmembrane_buried: ''
+transmembrane_interface: ''
+verbose: 1
+zero_indexed: 0

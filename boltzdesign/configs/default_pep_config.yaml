@@ -1,4 +1,4 @@
-binder_chain: B
+binder_chain: A
 design_algorithm: 3stages
 disconnect_feats: true
 disconnect_pairformer: false
@@ -16,7 +16,7 @@ learning_rate: 0.1
 learning_rate_pre: 1.0
 length_max: 170
 length_min: 90
-mask_ligand: false
+mask_target_prerun: false
 msa_max_seqs: 4096
 non_protein_target: false
 num_inter_contacts: 2
@@ -33,3 +33,4 @@ soft_iteration_2: 50
 temp_iteration: 45
 use_temp: true
 recycling_steps: 0
+noise_scaling: 0.1

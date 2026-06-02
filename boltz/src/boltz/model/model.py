@@ -320,6 +320,7 @@ class Boltz1(LightningModule):
         run_confidence_sequentially: bool = False,
         disconnect_feats: bool = False,
         disconnect_pairformer: bool = False,
+        disconnect_coords: bool = True,
     ) -> dict[str, Tensor]:
         dict_out = {}
 
@@ -379,11 +380,18 @@ class Boltz1(LightningModule):
             multiplicity=diffusion_samples,
             train_accumulate_token_repr=self.training,
         )
-        # Detach structure outputs but not the inputs
-        dict_out.update({
-            k: v.detach() if isinstance(v, torch.Tensor) else v 
-            for k, v in structure_out.items()
-        })
+        # Detach structure outputs but not the inputs.
+        # When disconnect_coords=False, keep the graph so gradients can flow
+        # from the confidence head back through the sampler (requires the
+        # sampler itself to run with grad enabled, e.g. attach_coords=True
+        # on AtomDiffusion).
+        if disconnect_coords:
+            dict_out.update({
+                k: v.detach() if isinstance(v, torch.Tensor) else v
+                for k, v in structure_out.items()
+            })
+        else:
+            dict_out.update(structure_out)
 
         if disconnect_feats:
             feats_ = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in feats.items()}
@@ -413,7 +421,7 @@ class Boltz1(LightningModule):
                         if self.confidence_module.use_s_diffusion
                         else None
                     ),
-                    x_pred=dict_out["sample_atom_coords"],  # Already detached above
+                    x_pred=dict_out["sample_atom_coords"],  # Detached above iff disconnect_coords=True
                     feats=feats_,
                     pred_distogram_logits=dict_out_pdistogram,
                     multiplicity=diffusion_samples,

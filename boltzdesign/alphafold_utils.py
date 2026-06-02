@@ -845,16 +845,28 @@ def process_yaml_files(yaml_dir, af_input_dir, af_input_apo_dir, target_type='sm
             other_seqs = [seq for i, seq in enumerate(yaml_data['sequences']) if i != chain_to_number[binder_chain]]
             ligand_smiles = []
             ligand_chain = []
+            metal_ccds = []
+            metal_chain = []
             for seq in other_seqs:
                 if 'ligand' in seq:
-                    ligand_smiles.append(seq['ligand']['smiles'])
-                    ligand_chain.append(seq['ligand']['id'])
+                    # A small-molecule target may be either a SMILES ligand or a
+                    # CCD ligand (e.g. HEM, emitted as ccd: by build_chain_dict
+                    # when --target_mols is a valid CCD code). Route each to the
+                    # right AF3 field: smiles -> ligand.smiles, ccd -> ligand.ccdCodes.
+                    if 'smiles' in seq['ligand']:
+                        ligand_smiles.append(seq['ligand']['smiles'])
+                        ligand_chain.append(seq['ligand']['id'])
+                    elif 'ccd' in seq['ligand']:
+                        metal_ccds.append(seq['ligand']['ccd'])
+                        metal_chain.append(seq['ligand']['id'])
 
-            json_result = build_json_sequence(name, 
+            json_result = build_json_sequence(name,
                 protein=[binder_seq],
                 protein_id=[binder_chain],
-                ligand=ligand_smiles,
-                ligand_id=ligand_chain) 
+                ligand=ligand_smiles or None,
+                ligand_id=ligand_chain or None,
+                metal=metal_ccds or None,
+                metal_id=metal_chain or None)
 
             json_result_apo = build_json_sequence(name,
                 protein=[binder_seq],
@@ -979,7 +991,80 @@ def process_yaml_files(yaml_dir, af_input_dir, af_input_apo_dir, target_type='sm
             json_result_apo = build_json_sequence(name,
                 protein=[binder_seq],
                 protein_id=['A'])
-                
+
+        elif target_type == 'multi':
+            # Mixed-target design: reconstruct every entity present in the boltz
+            # YAML (binder + any combination of protein/ligand/metal/rna/dna)
+            # into one AF3 holo JSON. Mirrors the per-type branches above but
+            # collects all entity kinds in a single pass, so the off-type
+            # targets are not dropped.
+            binder_seq = yaml_data['sequences'][chain_to_number[binder_chain]]['protein']['sequence']
+            prot_seqs, prot_ids, prot_msas, prot_queries = [], [], [], []
+            modification_ls, modification_chain = [], []
+            ligand_smiles, ligand_ids = [], []
+            metal_ccds, metal_ids = [], []
+            rna_seqs, dna_seqs = [], []
+
+            def _id0(entry_id):
+                return entry_id[0] if isinstance(entry_id, list) else entry_id
+
+            for seq in yaml_data['sequences']:
+                if 'protein' in seq:
+                    sid = _id0(seq['protein']['id'])
+                    prot_seqs.append(seq['protein']['sequence'])
+                    prot_ids.append(sid)
+                    prot_msas.append(seq['protein'].get('msa', 'empty'))
+                    query_seq_ls = list(seq['protein']['sequence'])
+                    if 'modifications' in seq['protein']:
+                        modification_ls.append(seq['protein']['modifications'])
+                        modification_chain.append(sid)
+                        for item in seq['protein']['modifications']:
+                            query_seq_ls[item['position'] - 1] = mod_to_wt_aa[item['ccd']]
+                    else:
+                        modification_ls.append([])
+                        modification_chain.append([])
+                    prot_queries.append(''.join(query_seq_ls))
+                elif 'ligand' in seq:
+                    if 'smiles' in seq['ligand']:
+                        ligand_smiles.append(seq['ligand']['smiles'])
+                        ligand_ids.append(seq['ligand']['id'])
+                    elif 'ccd' in seq['ligand']:
+                        metal_ccds.append(seq['ligand']['ccd'])
+                        metal_ids.append(seq['ligand']['id'])
+                elif 'rna' in seq:
+                    rna_seqs.append({'id': _id0(seq['rna']['id']), 'sequence': seq['rna']['sequence']})
+                elif 'dna' in seq:
+                    dna_seqs.append({'id': _id0(seq['dna']['id']), 'sequence': seq['dna']['sequence']})
+
+            json_result = build_json_sequence(name,
+                protein=prot_seqs,
+                protein_id=prot_ids,
+                modification_ls=modification_ls,
+                modification_chain=modification_chain,
+                ligand=ligand_smiles or None,
+                ligand_id=ligand_ids or None,
+                metal=metal_ccds or None,
+                metal_id=metal_ids or None,
+                rna=rna_seqs or None,
+                dna=dna_seqs or None,
+                afdb_dir=afdb_dir,
+                hmmer_path=hmmer_path)
+
+            # Protein entries occupy the first len(prot_seqs) slots (build_json_sequence
+            # appends protein -> rna -> dna -> ligand -> metal), so fill their MSAs by index.
+            for idx, (msa_path, query_seq) in enumerate(zip(prot_msas, prot_queries)):
+                if msa_path and msa_path != 'empty':
+                    protein_msa = extract_sequences_and_format(
+                        msa_path, replace_query_seq=True, query_seq=query_seq)
+                else:
+                    protein_msa = f">query\n{query_seq}"
+                json_result['sequences'][idx]['protein']['pairedMsa'] = protein_msa
+                json_result['sequences'][idx]['protein']['unpairedMsa'] = protein_msa
+
+            json_result_apo = build_json_sequence(name,
+                protein=[binder_seq],
+                protein_id=['A'])
+
         # Write output files
         with open(os.path.join(af_input_dir, f'{name}.json'), 'w') as f:
             json.dump(json_result, f, indent=4)

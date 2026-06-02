@@ -62,28 +62,47 @@ def parse_arguments():
         epilog="""
 Examples:
   # Design binder for DNA target
-  python boltzdesign_generalized.py --target_name 5zmc --target_type dna --pdb_target_ids C,D --target_mols SAM --binder_id A
+  python boltzdesign_generalized.py --target_name 5zmc --target_types dna --pdb_target_ids C,D --target_mols SAM --binder_id A
         """
     )
-    
+
     # Required arguments
     parser.add_argument('--target_name', type=str, required=True,
                         help='Target name/PDB code (e.g., 5zmc)')
     # Target configuration
-    parser.add_argument('--target_type', type=str, choices=['protein', 'rna', 'dna', 'small_molecule', 'metal'],
-                        default='protein', help='Type of target molecule')
+    parser.add_argument('--target_types', type=str, nargs='+', default=['protein'],
+                        help='Per-target types, one entry per target in chain order '
+                             '(e.g. --target_types protein small_molecule). Length 1 is '
+                             'single-target mode; the chosen type seeds the base default '
+                             'config (default_{ppi,sm,na,pep,metal}_config.yaml) and labels '
+                             'the output folder. Length >1 is multi-target: protein/dna/rna '
+                             'targets draw identifiers from --pdb_target_ids (in order), '
+                             'small_molecule/metal targets from --target_mols (in order); '
+                             'in --input_type custom mode all identifiers come from '
+                             '--custom_target_inputs (in order). The old quoted / comma '
+                             'forms ("protein small_molecule" or "protein,small_molecule") '
+                             'still work. Default "protein".')
     parser.add_argument('--input_type', type=str, choices=['pdb', 'custom'], default='pdb',
                         help='Input type: pdb code or custom input')
     parser.add_argument('--pdb_path', type=str, default='',
                         help='Path to a local PDB file (if specify use custom pdb, else fetch from RCSB)')
-    parser.add_argument('--pdb_target_ids', type=str, default='',
-                        help='Target PDB IDs (comma-separated, e.g., "C,D")')
-    parser.add_argument('--target_mols', type=str, default='',
-                        help='Target molecules for small molecules (comma-separated, e.g., "SAM,FAD")')
-    parser.add_argument('--custom_target_input', type=str, default='',
-                        help='Custom target sequences/ligand(smiles)/dna/rna/metals (comma-separated, e.g., "ATAT,GCGC", "[O-]C(=O)C(N)CC[S+](C)CC3OC(n2cnc1c(ncnc12)N)C(O)C3O", "ZN")')
-    parser.add_argument('--custom_target_ids', type=str, default='',
-                        help='Custom target IDs (comma-separated, e.g., "A,B")')
+    parser.add_argument('--pdb_target_ids', type=str, nargs='+', default=[],
+                        help='Target chain IDs in the PDB, e.g. --pdb_target_ids C D '
+                             '(old "C,D" form still works)')
+    parser.add_argument('--target_mols', type=str, nargs='+', default=[],
+                        help='Target ligand identifiers (CCD codes or non-CCD tokens), '
+                             'e.g. --target_mols HEM ZN (old "HEM,ZN" form still works)')
+    parser.add_argument('--custom_target_inputs', type=str, nargs='+', default=[],
+                        help='Custom target sequences / SMILES / CCD codes, one per target '
+                             'in --target_types order. Each value is its own token, so '
+                             'SMILES with shell-special characters quote naturally: '
+                             '--custom_target_inputs "ATAT" "GCGC" or '
+                             '--custom_target_inputs "<protein_seq>" "ZN" or '
+                             '--custom_target_inputs "[O-]C(=O)C(N)CC[S+](C)CC3OC(n2cnc1c(ncnc12)N)C(O)C3O". '
+                             'Old comma form still works.')
+    parser.add_argument('--custom_target_ids', type=str, nargs='+', default=[],
+                        help='Custom target chain IDs, e.g. --custom_target_ids A B '
+                             '(old "A,B" form still works)')
     parser.add_argument('--binder_id', type=str, default='A',
                         help='Binder chain ID')
     parser.add_argument('--use_msa', type=str2bool, default=False,
@@ -94,20 +113,29 @@ Examples:
                         help='Suffix for the output directory')
     
     # Modifications
-    parser.add_argument('--modifications', type=str, default='',
-                        help='Modifications (comma-separated, e.g., "SEP,SEP")')
-    parser.add_argument('--modifications_wt', type=str, default='',
-                        help='Modifications (comma-separated, e.g., "S,S")')
-    parser.add_argument('--modifications_positions', type=str, default='',
-                        help='Modification positions (comma-separated, matching order)')
+    parser.add_argument('--modifications', type=str, nargs='+', default=[],
+                        help='Modifications (per-residue CCD codes), e.g. '
+                             '--modifications SEP SEP (old "SEP,SEP" form still works)')
+    parser.add_argument('--modifications_wt', type=str, nargs='+', default=[],
+                        help='Wild-type AAs matching --modifications, e.g. '
+                             '--modifications_wt S S (old "S,S" form still works)')
+    parser.add_argument('--modifications_positions', type=str, nargs='+', default=[],
+                        help='Modification positions, e.g. --modifications_positions 10 20 '
+                             '(old "10,20" form still works)')
     parser.add_argument('--modification_target', type=str, default='',
                         help='Target ID for modifications (e.g., "A")')
     
     # Constraints
-    parser.add_argument('--constraint_target', type=str, default='',
-                        help='Target ID for constraints (e.g., "A")')
-    parser.add_argument('--contact_residues', type=str, default='',
-                        help='Contact residues for constraints (comma-separated, e.g., "99,100,109")')
+    parser.add_argument('--contact_residues', type=str, nargs='+', default=[],
+                        help='Pocket-conditioning contact residues, one token per '
+                             'contact: CHAIN:RESNUM (YAML chain ID, 1-indexed). '
+                             'Multi-target pockets supported by mixing chains: '
+                             '--contact_residues B:99 B:100 C:200 says "binder should '
+                             'contact residues 99,100 of chain B AND residue 200 of '
+                             'chain C." The model receives a single union pocket '
+                             'constraint. Old "99,100,109" form (bare numbers + '
+                             '--constraint_target) is no longer accepted -- prefix '
+                             'each token with its chain.')
 
     # Design parameters
     parser.add_argument('--length_min', type=int, default=100,
@@ -130,16 +158,57 @@ Examples:
                         help='Semi-greedy steps')
     parser.add_argument('--recycling_steps', type=int, default=0,
                         help='Recycling steps')
+    parser.add_argument('--sampling_steps', type=int, default=200,
+                        help='Number of EDM diffusion sampling steps (total step count) in the '
+                             'structure module. Lower = faster/coarser. Only affects the full '
+                             'pipeline (distogram_only=False, trajectory snapshots, and the final '
+                             'structure prediction). Default 200.')
     
     # Advanced configuration
     parser.add_argument('--use_default_config', type=str2bool, default=True,
                         help='Use default configuration (recommended)')
-    parser.add_argument('--mask_ligand', type=str2bool, default=False,
-                        help='Mask target for warm-up stage')
-    parser.add_argument('--optimize_contact_per_binder_pos', type=str2bool, default=False,
-                        help='Optimize interface contact per binder position')
+    parser.add_argument('--mask_target_prerun', type=str2bool, nargs='+', default=[],
+                        help='Per-target booleans: mask this target during the warm-up '
+                             '(pre_iteration) stage so the binder evolves topology before '
+                             'seeing it. One value per --target_types entry; length 1 '
+                             'broadcasts. Unset => per-type YAML default (sm/metal: True; '
+                             'protein/dna/rna/peptide: False). Renamed from --mask_ligand.')
+    parser.add_argument('--optimize_contact_per_binder_pos', type=str2bool, nargs='+', default=[],
+                        help='Per-target booleans: when True, every binder position must '
+                             'reach --num_inter_contacts to that target; when False the '
+                             'aggregate count is used. Length 1 broadcasts. Unset => per-'
+                             'type YAML default (ppi/na: True; sm/metal/pep: False).')
     parser.add_argument('--distogram_only', type=str2bool, default=True,
                         help='Only use distogram for optimization')
+    parser.add_argument('--use_heun', type=str2bool, default=False,
+                        help="Use Heun's second-order corrector in the diffusion sampler "
+                             "(applies only when distogram_only=False or during trajectory snapshots; "
+                             "doubles per-step NFE)")
+    parser.add_argument('--step_scale', type=float, default=1.638,
+                        help="Diffusion sampler step length / over-relaxation factor (eta): each Euler "
+                             "(and Heun) update is scaled by step_scale * (sigma_t - t_hat). "
+                             "Higher = larger denoising steps. Set to 1.0 for the velocity-consistent "
+                             "ODE step that, with --gamma_0 0, enables stable few-step inference. "
+                             "Baked into the model at load time. Default 1.638.")
+    parser.add_argument('--gamma_0', type=float, default=0.605,
+                        help="EDM churn level (gamma_0): the default schedule injects stochastic noise at "
+                             "high sigma. Set to 0.0 to switch to a noise-free ODE sampler. Combined with "
+                             "--step_scale 1.0 and a small --sampling_steps, this reproduces the "
+                             "manuscript's few-step (even 1-step) inference recipe. Only affects the full "
+                             "pipeline (distogram_only=False, trajectory snapshots, final prediction). "
+                             "Baked into the model at load time. Default 0.605.")
+    parser.add_argument('--deterministic_sampler', type=str2bool, default=False,
+                        help="Make the reverse diffusion sampler deterministic: disable per-step "
+                             "random augmentation (centering kept), skip the Kabsch/SVD alignment, "
+                             "and zero the EDM churn noise. Trades single-sample structural fidelity "
+                             "for a smooth, low-variance, SVD-free sequence->coords map; intended "
+                             "for stable rg/confidence-loss backprop with --attach_coords True. "
+                             "Baked into the model at load time. Default False.")
+    parser.add_argument('--attach_coords', type=str2bool, default=False,
+                        help="Keep sample_atom_coords attached to the autograd graph so "
+                             "confidence-head losses (plddt/pae/i_pae) backprop through the "
+                             "diffusion sampler. Only meaningful when distogram_only=False; "
+                             "increases memory/compute substantially.")
     parser.add_argument('--design_algorithm', type=str, choices=['3stages', '3stages_extra'], 
                         default='3stages', help='Design algorithm')
     parser.add_argument('--learning_rate', type=float, default=0.1,
@@ -154,35 +223,173 @@ Examples:
                         help='Additional softmax temperature for 3stages_extra')
     
     # Interaction parameters
-    parser.add_argument('--inter_chain_cutoff', type=int, default=20,
-                        help='Inter-chain distance cutoff')
+    parser.add_argument('--inter_chain_cutoff', type=float, nargs='+', default=[],
+                        help='Per-target inter-chain distance cutoff in Angstrom. One '
+                             'value per --target_types entry; length 1 broadcasts. Unset '
+                             '=> per-type YAML default (20 A for all bundled presets).')
     parser.add_argument('--intra_chain_cutoff', type=int, default=14,
-                        help='Intra-chain distance cutoff')
-    parser.add_argument('--num_inter_contacts', type=int, default=1,
-                        help='Number of inter-chain contacts')
+                        help='Intra-chain (binder-internal) distance cutoff. Singular.')
+    parser.add_argument('--num_inter_contacts', type=int, nargs='+', default=[],
+                        help='Per-target minimum inter-chain contacts. One value per '
+                             '--target_types entry; length 1 broadcasts. Unset => per-type '
+                             'YAML default (ppi/na/pep: 2; sm: 1; metal: 4).')
     parser.add_argument('--num_intra_contacts', type=int, default=2,
-                        help='Number of intra-chain contacts')
+                        help='Number of intra-chain (binder-internal) contacts. Singular.')
     
 
     # loss parameters
     parser.add_argument('--con_loss', type=float, default=1.0,
                         help='Contact loss weight')
-    parser.add_argument('--i_con_loss', type=float, default=1.0,
-                        help='Inter-chain contact loss weight')
+    parser.add_argument('--i_con_loss', type=float, nargs='+', default=[],
+                        help='Per-target inter-chain contact loss weight. One value per '
+                             '--target_types entry; length 1 broadcasts. Unset => 1.0 for '
+                             'every target (reproduces the prior global default). Setting '
+                             '0 for a target disables its contact term.')
     parser.add_argument('--plddt_loss', type=float, default=0.1,
-                        help='pLDDT loss weight')
+                        help='Binder-pLDDT loss weight. Singular (binder-only).')
     parser.add_argument('--pae_loss', type=float, default=0.4,
-                        help='PAE loss weight')
-    parser.add_argument('--i_pae_loss', type=float, default=0.1,
-                        help='Inter-chain PAE loss weight')
-    parser.add_argument('--rg_loss', type=float, default=0.0,
-                        help='Radius of gyration loss weight')
+                        help='Binder-internal PAE loss weight. Singular (binder-only).')
+    parser.add_argument('--i_pae_loss', type=float, nargs='+', default=[],
+                        help='Per-target inter-chain PAE loss weight. One value per '
+                             '--target_types entry; length 1 broadcasts. Unset => 0.1 for '
+                             'every target (reproduces the prior global default).')
+    parser.add_argument('--rg_loss', type=float, default=0.3,
+                        help='Radius of gyration loss weight (default 0.3, matching '
+                             'BindCraft weights_rg / use_rg_loss=true). Only contributes '
+                             'a gradient when --distogram_only False and --attach_coords True; '
+                             'otherwise it is reported but inert (sampler coords are detached).')
+    parser.add_argument('--com_loss', type=float, default=0.0,
+                        help='Binder centroid-of-mass loss weight. Pulls the binder CA '
+                             'COM toward the average of HETATM ORI atoms parsed from '
+                             '--pdb_path and/or --motif_pdb. Each ORI is rigid-body '
+                             'transformed from its source-PDB frame into the live '
+                             'co-fold frame via Kabsch alignment (target chains for '
+                             '--pdb_path; motif backbone for --motif_pdb). Default 0 = '
+                             'off. Only computed in full mode (--distogram_only False); '
+                             'carries a gradient only with --attach_coords True (mirrors '
+                             '--rg_loss). Insert ORI HETATMs into your input PDB as '
+                             '"HETATM .. ORI  ORI z   1   x  y  z" lines.')
+    parser.add_argument('--target_plddt_loss', type=float, nargs='+', default=[],
+                        help='Per-target pLDDT loss weight (boosts confidence in each '
+                             'target\'s own placement, e.g. a heme/Zn cofactor). One value '
+                             'per --target_types entry; length 1 broadcasts. Unset => 0.0 '
+                             'for every target (off by default; replaces the removed '
+                             '--target_plddt_chains gate -- set the per-target weight to '
+                             '0 to exclude a target). Only computed in full mode '
+                             '(--distogram_only False).')
     parser.add_argument('--helix_loss_max', type=float, default=0.0,
                         help='Maximum helix loss weights')
     parser.add_argument('--helix_loss_min', type=float, default=-0.3,
                         help='Minimum helix loss weights')
+    parser.add_argument('--motif_distogram_loss', type=float, default=1.0,
+                        help='Motif scaffolding distogram-CCE loss weight '
+                             '(ColabDesign `partial` dgram_cce). Only used when '
+                             '--motif_pdb is set. Formerly --motif_loss.')
+    parser.add_argument('--motif_coords_loss', type=float, default=1.0,
+                        help='Motif scaffolding coord-RMSD loss weight. Kabsch-'
+                             'aligned RMSD on the sampled atom coords; the rigid '
+                             'transform is fit from the protein motif backbone '
+                             '(N,CA,C,CB) ONLY, then applied to any ligand atoms '
+                             'specified by --motif_ligand_residues (decoupled '
+                             'alignment), and the combined RMSD is the optimized '
+                             'scalar. Active only when --motif_pdb is set AND '
+                             '--distogram_only False (needs sample_atom_coords). '
+                             'Carries a gradient only with --attach_coords True; '
+                             'otherwise reported but inert, mirroring --rg_loss.')
+    parser.add_argument('--motif_fape_loss', type=float, default=1.0,
+                        help='Motif scaffolding sidechain FAPE loss weight '
+                             '(AlphaFold-style frame-aligned point error of motif '
+                             'sidechain atoms in the motif backbone frames). Active '
+                             'only when --motif_pdb is set AND --distogram_only '
+                             'False AND shared sidechain heavy atoms exist (the '
+                             'binder is built as UNK, so by default only CB/CG). '
+                             'Gradient only with --attach_coords True.')
 
-    
+    # Motif scaffolding (ColabDesign `partial` protocol). Design a binder that
+    # also retains a given structural motif (e.g. a catalytic/cofactor-binding
+    # site) so the binder is itself an enzyme / small-molecule binder. Inactive
+    # unless --motif_pdb is provided.
+    parser.add_argument('--motif_pdb', type=str, default='',
+                        help='Reference PDB/CIF containing the motif to scaffold')
+    parser.add_argument('--motif_residues', type=str, nargs='+', default=[],
+                        help='Chain-prefixed motif residue selection, one token per '
+                             'residue/range, e.g. --motif_residues A57 A102 A195 (or '
+                             'A10-14 B57 C195 for multi-chain). Each token is '
+                             'CHAIN+RESNUM (author/PDB) in the motif PDB, ranges '
+                             'allowed. Bare residue numbers are rejected -- prefix '
+                             'the chain. One-to-one with --motif_binder_positions in '
+                             'declaration order. Old "A57,A102,A195" form still works.')
+    parser.add_argument('--motif_binder_positions', type=str, nargs='+', default=[],
+                        help='1-indexed binder positions the motif maps to (same count/'
+                             'order as --motif_residues), e.g. --motif_binder_positions '
+                             '30 75 110. Default: N-terminal contiguous block. Old '
+                             '"30,75,110" form still works.')
+    parser.add_argument('--fix_motif_seq', type=str2bool, default=True,
+                        help='Pin the motif residues to the reference sequence '
+                             '(retained + grad-frozen). False = scaffold '
+                             'geometry only, sequence stays designable.')
+    parser.add_argument('--motif_ligand_residues', type=str, nargs='+', default=[],
+                        help='Optional ligand residues in --motif_pdb to carry '
+                             'along with the motif under --motif_coords_loss, one '
+                             'token per residue: --motif_ligand_residues B1 (or '
+                             'B1 C401). Each is CHAIN+RESNUM (author/PDB) in the '
+                             'motif PDB. The Kabsch transform is fit on the protein '
+                             'motif backbone (unchanged by this flag), then applied '
+                             'to these ligand heavy atoms so their RMSD reports their '
+                             'placement RELATIVE to the motif framework -- the '
+                             'natural objective for hemoprotein scaffolding. '
+                             'Predicted ligand is matched in the designed system by '
+                             'resname (chain IDs may differ between motif PDB and '
+                             'the YAML-built design). Independent of '
+                             '--motif_binder_positions: ligand residues do NOT '
+                             'consume binder slots; they live in their own target '
+                             'chain (added via --target_mols). Old "B1,C401" form '
+                             'still works.')
+
+    # Explicit atom/residue distance restraints. Independent of the general
+    # binder-target contact loss, and usable between ANY two chains -- including
+    # target<->target (e.g. holding a cofactor near a specific target residue).
+    # Inactive unless --atom_pairs is set.
+    parser.add_argument('--atom_pairs', type=str, nargs='+', default=[],
+                        help='Distance restraints, one pair per token: '
+                             '--atom_pairs "epA, epB, lo, hi" ["epA, epB, lo, hi" ...]. '
+                             'Each endpoint is CHAIN:SEL[@ATOM]: SEL is a 1-indexed '
+                             'residue position for polymer chains or an atom name for '
+                             'ligand chains; @ATOM pins a named atom (coord loss only). '
+                             'lo/hi = target distance window in Angstrom. Example: '
+                             '--atom_pairs "C:FE1, B:145, 0, 6" '
+                             '"C:FE1, B:50@NE2, 1.8, 2.6". Old ";"-separated string '
+                             '("C:FE1, B:145, 0, 6; C:FE1, B:50@NE2, 1.8, 2.6") still '
+                             'works.')
+    parser.add_argument('--atom_pair_distogram_loss', type=float, default=1.0,
+                        help='Weight for the token-level distogram window loss '
+                             'over --atom_pairs (fast-mode safe; ligand atoms '
+                             'exact, polymer residues at Cβ). Inert unless '
+                             '--atom_pairs is set.')
+    parser.add_argument('--atom_pair_coords_loss', type=float, default=1.0,
+                        help='Weight for the atom-level coord distance restraint '
+                             'over --atom_pairs (flat-bottom). Active only with '
+                             '--distogram_only False; carries a gradient only '
+                             'with --attach_coords True (mirrors '
+                             '--motif_coords_loss). Inert unless --atom_pairs set.')
+    parser.add_argument('--atom_pair_distogram_loss_type', type=str, default='prob',
+                        choices=['prob', 'expected', 'contact'],
+                        help="How the --atom_pairs distogram restraint is computed: "
+                             "'prob' = -log P(d in [lo,hi]) over the in-window "
+                             "probability mass (original, default); 'expected' = "
+                             "flat-bottom relu(lo-E[d])^2+relu(E[d]-hi)^2 on the "
+                             "expected distance E[d]=sum(prob*mid_pts) (force grows "
+                             "with distance but saturates at the far end); "
+                             "'contact' = BoltzDesign1's own categorical contact "
+                             "loss (cutoff=hi, lo ignored): a robust attractive "
+                             "gradient that is large when far and tapers near -- "
+                             "recommended for pulling a far pair into contact. All "
+                             "three are capped by the distogram's ~24.5 A ceiling; "
+                             "for a truly unbounded long-range pull use the coord "
+                             "loss in full mode (--distogram_only False "
+                             "--attach_coords True). Inert unless --atom_pairs set.")
+
+
     # LigandMPNN parameters
     parser.add_argument('--num_designs', type=int, default=2,
                         help='Number of designs per PDB for LigandMPNN')
@@ -204,13 +411,13 @@ Examples:
                         help='Disable high iPTM designs')
     # Paths
     parser.add_argument('--boltz_checkpoint', type=str,
-        default='~/.boltz/boltz1_conf.ckpt',
+        default='/opt/boltz1_weights/boltz1_conf.ckpt',
         help='Path to Boltz checkpoint')
     parser.add_argument('--ccd_path', type=str,
-        default='~/.boltz/ccd.pkl',
+        default='/opt/boltz1_weights/ccd.pkl',
         help='Path to CCD file')
     parser.add_argument('--alphafold_dir', type=str,
-        default='~/alphafold3',
+        default='/opt/alphafold3',
         help='AlphaFold directory')
     parser.add_argument('--af3_docker_name', type=str,
         default='alphafold3',
@@ -239,6 +446,11 @@ Examples:
                         help='Show animation')
     parser.add_argument('--save_trajectory', type=str2bool, default=False,
                         help='Save trajectory')
+    parser.add_argument('--save_intermediate_structures', type=str2bool, default=False,
+                        help='Dump the per-epoch folded structure as a PDB when '
+                             'the diffusion sampler runs (i.e. --distogram_only False '
+                             'or --save_trajectory True). Writes to '
+                             '<output>/intermediate_structures/{stage}_epoch{NNNN}.pdb.')
     return parser.parse_args()
 
 
@@ -263,16 +475,200 @@ def load_boltz_model(args, device):
     """Load Boltz model"""
     predict_args = {
         "recycling_steps": args.recycling_steps,
-        "sampling_steps": 200,
+        "sampling_steps": args.sampling_steps,
         "diffusion_samples": 1,
         "write_confidence_summary": True,
         "write_full_pae": False,
         "write_full_pde": False,
     }
     
-    boltz_model = get_boltz_model(args.boltz_checkpoint, predict_args, device)
+    boltz_model = get_boltz_model(args.boltz_checkpoint, predict_args, device, use_heun=args.use_heun, attach_coords=args.attach_coords, step_scale=args.step_scale, deterministic_sampler=args.deterministic_sampler, gamma_0=args.gamma_0)
     boltz_model.train()
     return boltz_model, predict_args
+
+def _split_csv(value):
+    """Normalize a list-valued arg to a list of stripped, non-empty tokens.
+
+    Accepts three forms so every caller works regardless of how the user
+    passed the flag:
+      - empty / None -> []
+      - str ("a,b" or "a b") -> split on whitespace and commas
+      - list (from nargs="+") -> flatten each element on whitespace + commas
+    Splitting inside list elements preserves back-compat with the old quoted
+    "a,b" / "a b" forms when those land as a single nargs token.
+    """
+    if not value:
+        return []
+    items = [value] if isinstance(value, str) else list(value)
+    out = []
+    for item in items:
+        for tok in str(item).replace(",", " ").split():
+            out.append(tok)
+    return out
+
+
+def parse_contact_residues_spec(tokens):
+    """Parse chain-prefixed --contact_residues tokens into [(chain, res), ...].
+
+    Each token is CHAIN:RESNUM where CHAIN is a single uppercase letter (YAML
+    chain ID) and RESNUM is a 1-indexed integer. Accepts the legacy quoted /
+    comma forms via _split_csv (so "B:99 B:100 C:200", "B:99,B:100,C:200" and
+    --contact_residues B:99 B:100 C:200 all parse identically). Bare numbers
+    are rejected with a clear migration error pointing to the new format.
+    """
+    out = []
+    for tok in _split_csv(tokens):
+        if ":" not in tok:
+            raise ValueError(
+                f"--contact_residues token '{tok}' is missing a chain prefix. "
+                f"Use CHAIN:RESNUM (e.g. B:99). The bare-number form + "
+                f"--constraint_target is no longer supported -- prefix the "
+                f"chain on every token.")
+        chain, res = tok.split(":", 1)
+        chain, res = chain.strip(), res.strip()
+        if len(chain) != 1 or not chain.isupper():
+            raise ValueError(
+                f"--contact_residues token '{tok}': chain prefix must be one "
+                f"uppercase letter (got '{chain}')")
+        try:
+            res_int = int(res)
+        except ValueError:
+            raise ValueError(
+                f"--contact_residues token '{tok}': residue '{res}' is not an "
+                f"integer")
+        out.append((chain, res_int))
+    return out
+
+
+def _split_semi(value):
+    """Normalize an --atom_pairs-style arg to a list of full-pair strings.
+
+    Each returned string is one complete pair (commas preserved); downstream
+    parsers (parse_atom_pairs_spec) handle the comma-tuples inside. Always
+    splits on ';' inside every element, so:
+      - str ("p1; p2") -> ['p1', 'p2']
+      - native nargs ["p1", "p2"] -> ['p1', 'p2']
+      - quoted-legacy nargs ["p1; p2"] -> ['p1', 'p2']
+    """
+    if not value:
+        return []
+    items = [value] if isinstance(value, str) else list(value)
+    out = []
+    for item in items:
+        for s in str(item).split(";"):
+            s = s.strip()
+            if s:
+                out.append(s)
+    return out
+
+
+def get_all_target_types(args):
+    """Return the per-target type list for this run, parsed from --target_types.
+
+    Length 1 = single-target mode (reproduces the old ``--target_type`` path);
+    length >1 = multi-target mode. All targets are contacted symmetrically by
+    the design loop -- there is no "primary" target; this list only describes
+    how each target's YAML entry is built and whether any target is a protein
+    (for the MSA path).
+    """
+    types = _split_csv(args.target_types)
+    if not types:
+        raise ValueError("--target_types is empty; provide at least one target type")
+    valid = {'protein', 'rna', 'dna', 'small_molecule', 'metal'}
+    bad = [t for t in types if t not in valid]
+    if bad:
+        raise ValueError(f"--target_types contains unknown type(s): {bad}; "
+                         f"valid: {sorted(valid)}")
+    return types
+
+
+def get_target_chain_ids(args):
+    """Per-target chain IDs in --target_types order, skipping --binder_id.
+
+    Mirrors the chain-letter assignment in build_chain_dict / generate_yaml_config:
+    targets get 'A','B','C',... minus the binder letter, in declaration order. So
+    --binder_id A + --target_types protein small_molecule -> ['B','C'].
+    """
+    types_list = get_all_target_types(args)
+    letters = [c for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' if c != args.binder_id]
+    return letters[:len(types_list)]
+
+
+# Per-target settings sourced from the per-type default YAML. Each entry is
+# (cli-flag attribute name on args, key inside the YAML file). The user's CLI
+# value -- if provided -- wins; otherwise the YAML for each target's type is
+# consulted (so `--target_types protein small_molecule` picks ppi's value for
+# target 0 and sm's value for target 1).
+_PER_TARGET_YAML_SETTINGS = (
+    ('mask_target_prerun', 'mask_target_prerun'),
+    ('num_inter_contacts', 'num_inter_contacts'),
+    ('optimize_contact_per_binder_pos', 'optimize_contact_per_binder_pos'),
+    ('inter_chain_cutoff', 'inter_chain_cutoff'),
+)
+
+# Per-target loss-weight settings: (CLI flag name on args, kwarg name expected
+# by boltz_hallucination, default value). Each default matches the prior global
+# behavior: i_con_loss 1.0 / i_pae_loss 0.1 reproduce the old loss_scales;
+# target_plddt_loss 0.0 keeps the term off unless the user opts in (replaces
+# the removed --target_plddt_chains gate -- setting a per-target weight to 0 is
+# the new "off for this target" knob).
+_PER_TARGET_LOSS_WEIGHTS = (
+    ('i_con_loss', 'i_con_loss_weights', 1.0),
+    ('i_pae_loss', 'i_pae_loss_weights', 0.1),
+    ('target_plddt_loss', 'target_plddt_loss_weights', 0.0),
+)
+
+
+def _broadcast_to_targets(values, n, flag_name):
+    """Validate a per-target CLI list: length 1 broadcasts to n; length n is
+    used as-is; anything else is an error. Empty list -> caller will substitute
+    the auto-derived defaults."""
+    if not values:
+        return None
+    if len(values) == 1:
+        return list(values) * n
+    if len(values) != n:
+        raise ValueError(
+            f"--{flag_name} has {len(values)} entries but --target_types lists "
+            f"{n} target(s); provide either 1 (broadcast) or {n} values.")
+    return list(values)
+
+
+def derive_per_target_settings(args, work_dir):
+    """Build the per-target value lists for every per-target setting.
+
+    For each setting, the user's CLI list (with length-1 broadcast) wins; if
+    they passed nothing, the per-type YAML is consulted per target. Returns a
+    dict keyed by the same attribute names on args.
+    """
+    types_list = get_all_target_types(args)
+    n = len(types_list)
+    settings = {}
+
+    # YAML-sourced: cache load_design_config per unique type so we read each
+    # file at most once.
+    _yaml_cache = {}
+    def _yaml_for(t):
+        if t not in _yaml_cache:
+            _yaml_cache[t] = load_design_config(t, work_dir)
+        return _yaml_cache[t]
+
+    for cli_name, yaml_key in _PER_TARGET_YAML_SETTINGS:
+        user_val = getattr(args, cli_name)
+        bcast = _broadcast_to_targets(user_val, n, cli_name)
+        if bcast is not None:
+            settings[cli_name] = bcast
+        else:
+            settings[cli_name] = [_yaml_for(t)[yaml_key] for t in types_list]
+
+    # Loss weights (constant defaults; CLI name differs from kwarg name).
+    for cli_name, kwarg_name, default in _PER_TARGET_LOSS_WEIGHTS:
+        user_val = getattr(args, cli_name)
+        bcast = _broadcast_to_targets(user_val, n, cli_name)
+        settings[kwarg_name] = bcast if bcast is not None else [default] * n
+
+    return settings
+
 
 def load_design_config(target_type, work_dir):
     """
@@ -319,25 +715,38 @@ def get_explicit_args():
 def update_config_with_args(config, args):
     """Update configuration with command line arguments"""
     # Always update these basic parameters regardless of use_default_config
+    work_dir = args.work_dir or os.getcwd()
     basic_params = {
     'binder_chain': args.binder_id,
-    'non_protein_target': args.target_type != 'protein',
+    # Single-sequence (no-MSA) path unless at least one target is a protein,
+    # in which case the protein-MSA path is used.
+    'non_protein_target': not any(t == 'protein' for t in get_all_target_types(args)),
     'pocket_conditioning': bool(args.contact_residues),
+    # Per-target ID list for the design loop's per-target masks.
+    'target_chain_ids': get_target_chain_ids(args),
+    # COM loss inputs: pdb_path is read inside boltz_hallucination to extract
+    # ORI HETATMs + their target-chain Kabsch anchor; com_loss_weight gates
+    # the loss. Either one being None/0 keeps the loss off, byte-identical to
+    # pre-feature runs.
+    'pdb_path': args.pdb_path,
+    'com_loss_weight': args.com_loss,
     }
+    # Per-target settings: user CLI lists (with length-1 broadcast) win;
+    # otherwise pulled from the per-type default YAML for each target.
+    basic_params.update(derive_per_target_settings(args, work_dir))
 
     # Update basic parameters
     explicit_args = get_explicit_args()
     config.update(basic_params)
-    
+
     # For advanced parameters, only update those that are explicitly set by the user
     # (i.e., different from their default values in argparse)
     parser = argparse.ArgumentParser()
     _, defaults = parser.parse_known_args([])  # Get default values
-    
+
     advanced_params = {
-        'mask_ligand': args.mask_ligand,
-        'optimize_contact_per_binder_pos': args.optimize_contact_per_binder_pos,
         'distogram_only': args.distogram_only,
+        'attach_coords': args.attach_coords,
         'design_algorithm': args.design_algorithm,
         'learning_rate': args.learning_rate,
         'learning_rate_pre': args.learning_rate_pre,
@@ -346,9 +755,7 @@ def update_config_with_args(config, args):
         'e_soft_2': args.e_soft_2,
         'length_min': args.length_min,
         'length_max': args.length_max,
-        'inter_chain_cutoff': args.inter_chain_cutoff,
         'intra_chain_cutoff': args.intra_chain_cutoff,
-        'num_inter_contacts': args.num_inter_contacts,
         'num_intra_contacts': args.num_intra_contacts,
         'helix_loss_max': args.helix_loss_max,
         'helix_loss_min': args.helix_loss_min,
@@ -360,6 +767,17 @@ def update_config_with_args(config, args):
         'semi_greedy_steps': args.semi_greedy_steps,
         'msa_max_seqs': args.msa_max_seqs,
         'recycling_steps': args.recycling_steps,
+        'sampling_steps': args.sampling_steps,
+        'motif_pdb': args.motif_pdb,
+        # Re-emit the list-valued nargs="+" flags as the legacy comma/`;`-separated
+        # strings the downstream parsers in boltzdesign_utils consume (parse_motif_*,
+        # parse_atom_pairs_spec). This keeps the parser surface in utils unchanged.
+        'motif_residues': ",".join(_split_csv(args.motif_residues)),
+        'motif_binder_positions': ",".join(_split_csv(args.motif_binder_positions)),
+        'fix_motif_seq': args.fix_motif_seq,
+        'motif_ligand_residues': ",".join(_split_csv(args.motif_ligand_residues)),
+        'atom_pairs': "; ".join(_split_semi(args.atom_pairs)),
+        'atom_pair_distogram_loss_type': args.atom_pair_distogram_loss_type,
     }
 
     for param_name, param_value in advanced_params.items():
@@ -372,13 +790,24 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
     """Run the Boltz design step"""
     print("Starting Boltz design step...")
     
+    # Per-target loss weights (i_con_loss, i_pae_loss, target_plddt_loss) are
+    # applied inside get_model_loss before the per-target sum, so the global
+    # loss_scales multiplier is 1.0 for those keys (no double-weighting). All
+    # other losses keep their global weight here.
     loss_scales = {
         'con_loss': args.con_loss,
-        'i_con_loss': args.i_con_loss,
+        'i_con_loss': 1.0,
         'plddt_loss': args.plddt_loss,
         'pae_loss': args.pae_loss,
-        'i_pae_loss': args.i_pae_loss,
+        'i_pae_loss': 1.0,
         'rg_loss': args.rg_loss,
+        'com_loss': args.com_loss,
+        'target_plddt_loss': 1.0,
+        'motif_distogram_loss': args.motif_distogram_loss,
+        'motif_coords_loss': args.motif_coords_loss,
+        'motif_fape_loss': args.motif_fape_loss,
+        'atom_pair_distogram_loss': args.atom_pair_distogram_loss,
+        'atom_pair_coords_loss': args.atom_pair_coords_loss,
     }
     
     boltz_path = shutil.which("boltz")
@@ -397,6 +826,7 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         loss_scales=loss_scales,
         show_animation=args.show_animation,
         save_trajectory=args.save_trajectory,
+        save_intermediate_structures=args.save_intermediate_structures,
         redo_boltz_predict=args.redo_boltz_predict,
     )
     
@@ -439,7 +869,7 @@ def run_ligandmpnn_step(args, main_dir, version_name, ligandmpnn_dir, yaml_dir, 
     run_ligandmpnn_redesign(
         ligandmpnn_dir, pdb_save_dir, shutil.which("boltz"),
         os.path.dirname(yaml_dir), yaml_path, top_k=args.num_designs, cutoff=args.cutoff,
-        non_protein_target=args.target_type != 'protein', binder_chain=args.binder_id,
+        non_protein_target=not any(t == 'protein' for t in get_all_target_types(args)), binder_chain=args.binder_id,
         target_chains="all", out_dir=lmpnn_redesigned_fa_dir,
         lmpnn_yaml_dir=lmpnn_redesigned_yaml_dir, results_final_dir=lmpnn_redesigned_dir
     )
@@ -525,6 +955,7 @@ def calculate_holo_apo_rmsd(af_pdb_dir, af_pdb_dir_apo, binder_chain):
 def run_alphafold_step(args, ligandmpnn_dir, work_dir, mod_to_wt_aa):
     """Run AlphaFold validation step"""
     print("Starting AlphaFold validation step...")
+    types_list = get_all_target_types(args)
 
     alphafold_dir = os.path.expanduser(args.alphafold_dir)
     afdb_dir = os.path.expanduser(args.af3_database_settings)
@@ -549,7 +980,7 @@ def run_alphafold_step(args, ligandmpnn_dir, work_dir, mod_to_wt_aa):
         yaml_dir_success_boltz_yaml,
         af_input_dir,
         af_input_apo_dir,
-        target_type=args.target_type,
+        target_type=('multi' if len(types_list) > 1 else types_list[0]),
         binder_chain=args.binder_id,
         mod_to_wt_aa=mod_to_wt_aa,
         afdb_dir=afdb_dir,
@@ -591,8 +1022,8 @@ def run_alphafold_step(args, ligandmpnn_dir, work_dir, mod_to_wt_aa):
 
 def run_rosetta_step(args, ligandmpnn_dir, af_output_dir, af_output_apo_dir, af_pdb_dir, af_pdb_dir_apo):
     """Run Rosetta energy calculation (protein targets only)"""
-    if args.target_type != 'protein':
-        print("Skipping Rosetta step (not a protein target)")
+    if not any(t == 'protein' for t in get_all_target_types(args)):
+        print("Skipping Rosetta step (no protein target)")
         return
     
     print("Starting Rosetta energy calculation...")
@@ -608,6 +1039,10 @@ def run_rosetta_step(args, ligandmpnn_dir, af_output_dir, af_output_apo_dir, af_
 def setup_environment():
     """Setup environment and parse arguments"""
     args = parse_arguments()
+    # Validate --target_types eagerly so a typo fails at startup, not deep in
+    # the pipeline. Read the list via get_all_target_types(args) wherever
+    # needed -- no derived args.target_type attribute is maintained.
+    get_all_target_types(args)
     work_dir = args.work_dir or os.getcwd()
     os.chdir(work_dir)
     setup_gpu_environment(args.gpu_id)
@@ -616,15 +1051,20 @@ def setup_environment():
     return args
 
 def get_target_ids(args):
-    """Get target IDs from either PDB or custom input"""
-    target_ids = args.pdb_target_ids if args.input_type == "pdb" else args.custom_target_ids
-    
-    if (args.contact_residues or args.modifications) and not target_ids:
-        input_type = "PDB" if args.input_type == "pdb" else "Custom"
-        raise ValueError(f"{input_type} target IDs must be provided when using contacts or modifications")
-        sys.exit(1)
+    """Get target IDs from either PDB or custom input.
 
-    return [str(x.strip()) for x in target_ids.split(",")] if target_ids else []
+    Required for modifications (target_id_map maps the user's --modification_target
+    to its YAML chain letter); contact_residues carries its own chain prefix per
+    token so it no longer needs the map.
+    """
+    target_ids = _split_csv(args.pdb_target_ids if args.input_type == "pdb"
+                            else args.custom_target_ids)
+
+    if args.modifications and not target_ids:
+        input_type = "PDB" if args.input_type == "pdb" else "Custom"
+        raise ValueError(f"{input_type} target IDs must be provided when using modifications")
+
+    return target_ids
 
 def assign_chain_ids(target_ids_list, binder_chain='A'):
     """Maps target IDs to unique chain IDs, skipping binder_chain."""
@@ -637,7 +1077,7 @@ def initialize_pipeline(args):
     work_dir = args.work_dir or os.getcwd()
     boltz_model, _ = load_boltz_model(args, torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
     
-    config_obj = YamlConfig(main_dir=f'{work_dir}/inputs/{args.target_type}_{args.target_name}_{args.suffix}')
+    config_obj = YamlConfig(main_dir=f'{work_dir}/inputs/{get_all_target_types(args)[0]}_{args.target_name}_{args.suffix}')
     config_obj.setup_directories()
     return boltz_model, config_obj
 
@@ -647,13 +1087,31 @@ def generate_yaml_config(args, config_obj):
         target_ids_list = get_target_ids(args)
         target_id_map = assign_chain_ids(target_ids_list, args.binder_id)
         print(f"Mapped target IDs: {list(target_id_map.values())}")
-        constraints, modifications = process_design_constraints(target_id_map, args.modifications, args.modifications_positions, args.modification_target, args.contact_residues, args.constraint_target, args.binder_id)
+        # Modifications still flow as legacy CSV strings; contact_residues is
+        # parsed to a chain-prefixed (chain, res) list which setup_constraints
+        # emits directly as the pocket-constraint contacts array (one union
+        # block across all referenced target chains -- the model takes one
+        # inference_pocket).
+        constraints, modifications = process_design_constraints(
+            target_id_map,
+            ",".join(_split_csv(args.modifications)),
+            ",".join(_split_csv(args.modifications_positions)),
+            args.modification_target,
+            parse_contact_residues_spec(args.contact_residues),
+            args.binder_id,
+        )
     else:
         constraints, modifications = None, None
+    # Per-target type list, in chain order. Length-1 -> single-target mode (the
+    # legacy --target_type path); all targets are contacted symmetrically by
+    # the design loop regardless.
+    types_list = get_all_target_types(args)
+    multi = len(types_list) > 1
     target = []
+
     if args.input_type == "pdb":
-        pdb_target_ids = [str(x.strip()) for x in args.pdb_target_ids.split(",")] if args.pdb_target_ids else None
-        target_mols = [str(x.strip()) for x in args.target_mols.split(",")] if args.target_mols else None
+        pdb_target_ids = _split_csv(args.pdb_target_ids)
+        target_mols = _split_csv(args.target_mols)
         if args.pdb_path:
             pdb_path = Path(args.pdb_path)
             print("load local pdb from", pdb_path)
@@ -664,28 +1122,95 @@ def generate_yaml_config(args, config_obj):
             download_pdb(args.target_name, config_obj.PDB_DIR)
             pdb_path = config_obj.PDB_DIR / f"{args.target_name}.pdb"
 
-        if args.target_type in ['rna', 'dna']:
-            nucleotide_dict = get_nucleotide_from_pdb(pdb_path)
-            for target_id in pdb_target_ids:
-                target.append(nucleotide_dict[target_id]['seq'])
-        elif args.target_type == 'small_molecule':
-            ligand_dict = get_ligand_from_pdb(args.target_name)
-            for target_mol in target_mols:
-                print(target_mol, ligand_dict.keys())
-                target.append(ligand_dict[target_mol])
-        elif args.target_type == 'protein':
-            chain_sequences = get_chains_sequence(pdb_path)
-            for target_id in pdb_target_ids:
-                target.append(chain_sequences[target_id])
+        # Lookups are built lazily and cached so a mixed target set only parses
+        # what it needs. The ligand source mirrors the single-type fix: a local
+        # file when --pdb_path is given (target_name may be a user label, not a
+        # real PDB ID), else the target_name-as-PDB-ID auto-fetch.
+        _nuc = _lig = _chains = None
+        def _ligand_lookup():
+            return get_ligand_from_pdb(str(pdb_path) if args.pdb_path else args.target_name)
+
+        if multi:
+            # Protein/dna/rna draw identifiers from --pdb_target_ids; small
+            # molecule/metal from --target_mols. Each is consumed in order.
+            n_pdb = sum(1 for t in types_list if t in ('protein', 'dna', 'rna'))
+            n_mol = sum(1 for t in types_list if t in ('small_molecule', 'metal'))
+            if n_pdb != len(pdb_target_ids):
+                raise ValueError(
+                    f"--target_types needs {n_pdb} protein/dna/rna identifier(s) "
+                    f"from --pdb_target_ids, got {len(pdb_target_ids)}: {pdb_target_ids}")
+            if n_mol != len(target_mols):
+                raise ValueError(
+                    f"--target_types needs {n_mol} small_molecule/metal identifier(s) "
+                    f"from --target_mols, got {len(target_mols)}: {target_mols}")
+
+            pi = mi = 0  # cursors into pdb_target_ids / target_mols
+            for t in types_list:
+                if t == 'protein':
+                    if _chains is None:
+                        _chains = get_chains_sequence(pdb_path)
+                    target.append(_chains[pdb_target_ids[pi]]); pi += 1
+                elif t in ('dna', 'rna'):
+                    if _nuc is None:
+                        _nuc = get_nucleotide_from_pdb(pdb_path)
+                    target.append(_nuc[pdb_target_ids[pi]]['seq']); pi += 1
+                elif t == 'small_molecule':
+                    _tm = target_mols[mi]
+                    # CCD code -> CCD ligand ({'ccd': code}); else perceive
+                    # SMILES (see single-type branch below for the rationale).
+                    if is_ccd_code(_tm):
+                        target.append({'ccd': _tm})
+                    else:
+                        if _lig is None:
+                            _lig = _ligand_lookup()
+                        print(_tm, _lig.keys())
+                        target.append(_lig[_tm])
+                    mi += 1
+                elif t == 'metal':
+                    target.append(target_mols[mi]); mi += 1  # CCD code, used as-is
+                else:
+                    raise ValueError(f"Unsupported target type: {t}")
         else:
-            raise ValueError(f"Unsupported target type: {args.target_type}")
+            if types_list[0] in ['rna', 'dna']:
+                _nuc = get_nucleotide_from_pdb(pdb_path)
+                for target_id in pdb_target_ids:
+                    target.append(_nuc[target_id]['seq'])
+            elif types_list[0] == 'small_molecule':
+                for target_mol in target_mols:
+                    # A valid CCD code (e.g. HEM) is emitted as a CCD ligand
+                    # ({'ccd': code} -> canonical resname + atom names, needed
+                    # for the motif ligand carry-along / atom_pairs) and never
+                    # goes through PDB SMILES perception (which also skips HEM
+                    # et al. via get_ligand_from_pdb's IGNORE_LIST). Non-CCD
+                    # codes (e.g. 6TR) fall back to perceived SMILES from the PDB.
+                    if is_ccd_code(target_mol):
+                        target.append({'ccd': target_mol})
+                    else:
+                        if _lig is None:
+                            _lig = _ligand_lookup()
+                        print(target_mol, _lig.keys())
+                        target.append(_lig[target_mol])
+            elif types_list[0] == 'protein':
+                _chains = get_chains_sequence(pdb_path)
+                for target_id in pdb_target_ids:
+                    target.append(_chains[target_id])
+            else:
+                raise ValueError(f"Unsupported target type: {types_list[0]}")
     else:
-        target_inputs = [str(x.strip()) for x in args.custom_target_input.split(",")] if args.custom_target_input else []
+        target_inputs = _split_csv(args.custom_target_inputs)
         target = target_inputs or [args.target_name]
+        if multi and len(types_list) != len(target):
+            raise ValueError(
+                f"--target_types lists {len(types_list)} type(s) but "
+                f"--custom_target_inputs has {len(target)} entr(ies); they must "
+                f"match one-to-one and in order.")
+
+    # str (broadcast) for single-type, per-target list for multi-type.
+    target_types_arg = types_list if multi else types_list[0]
 
     return generate_yaml_for_target_binder(
-        args.target_name, 
-        args.target_type,
+        args.target_name,
+        target_types_arg,
         target,
         config=config_obj,
         binder_id=args.binder_id,
@@ -698,7 +1223,7 @@ def generate_yaml_config(args, config_obj):
 def setup_pipeline_config(args):
     """Setup pipeline configuration"""
     work_dir = args.work_dir or os.getcwd()
-    config = load_design_config(args.target_type, work_dir)
+    config = load_design_config(get_all_target_types(args)[0], work_dir)
     return update_config_with_args(config, args)
 
 def setup_output_directories(args):
@@ -708,16 +1233,16 @@ def setup_output_directories(args):
     os.makedirs(main_dir, exist_ok=True)
     return {
         'main_dir': main_dir,
-        'version': f'{args.target_type}_{args.target_name}_{args.suffix}'
+        'version': f'{get_all_target_types(args)[0]}_{args.target_name}_{args.suffix}'
     }
 def modification_to_wt_aa(modifications, modifications_wt):
-    """Convert modifications to WT AA"""
-    if not modifications:
+    """Convert modifications to WT AA. Accepts either the legacy CSV strings or
+    the nargs="+" lists -- _split_csv normalizes both."""
+    mods = _split_csv(modifications)
+    wts = _split_csv(modifications_wt)
+    if not mods:
         return None, None
-    mod_to_wt_aa = {}
-    for mod, wt in zip(modifications.split(','), modifications_wt.split(',')):
-        mod_to_wt_aa[mod] = wt
-    return mod_to_wt_aa
+    return {mod: wt for mod, wt in zip(mods, wts)}
 
 def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir):
     """Run the pipeline steps based on arguments"""

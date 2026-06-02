@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Pipeline working dirs
+inputs/
+outputs/
+outputs_*/
+
+# LigandMPNN downloads / data
+LigandMPNN/model_params/
+LigandMPNN/wget-log
+
+# Raw PDB / structure files at repo root
+/*.pdb
+/*.pdb.gz
+/*.cif
+
+# Editor / OS noise
+.ipynb_checkpoints/
+.DS_Store

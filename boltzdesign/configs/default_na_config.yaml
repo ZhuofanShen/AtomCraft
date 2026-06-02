@@ -16,8 +16,9 @@ learning_rate: 0.1
 learning_rate_pre: 1.0
 length_max: 180
 length_min: 100
-mask_ligand: false
+mask_target_prerun: false
 msa_max_seqs: 4096
+non_protein_target: true
 num_inter_contacts: 2
 num_intra_contacts: 2
 optimize_contact_per_binder_pos: true
