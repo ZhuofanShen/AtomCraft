@@ -351,16 +351,18 @@ Examples:
     # target<->target (e.g. holding a cofactor near a specific target residue).
     # Inactive unless --atom_pairs is set.
     parser.add_argument('--atom_pairs', type=str, nargs='+', default=[],
-                        help='Distance restraints, one pair per token: '
-                             '--atom_pairs "epA, epB, lo, hi" ["epA, epB, lo, hi" ...]. '
-                             'Each endpoint is CHAIN:SEL[@ATOM]: SEL is a 1-indexed '
-                             'residue position for polymer chains or an atom name for '
-                             'ligand chains; @ATOM pins a named atom (coord loss only). '
-                             'lo/hi = target distance window in Angstrom. Example: '
-                             '--atom_pairs "C:FE1, B:145, 0, 6" '
-                             '"C:FE1, B:50@NE2, 1.8, 2.6". Old ";"-separated string '
-                             '("C:FE1, B:145, 0, 6; C:FE1, B:50@NE2, 1.8, 2.6") still '
-                             'works.')
+                        help='Distance restraints, one pair per token. Two forms: '
+                             '4-field WINDOW "epA, epB, lo, hi" (flat-bottom in [lo,hi]) '
+                             'or 3-field POINT "epA, epB, d_ref" (treated as lo=hi=d_ref; '
+                             'with --atom_pair_distogram_loss_type expected this becomes '
+                             'the bin-center MSE sum_k p_k * (mid_pts_k - d_ref)^2 on the '
+                             'predicted distogram). Each endpoint is CHAIN:SEL[@ATOM]: '
+                             'SEL is a 1-indexed residue position for polymer chains or an '
+                             'atom name for ligand chains; @ATOM pins a named atom (coord '
+                             'loss only). All distances in Angstrom. Examples: '
+                             '--atom_pairs "C:FE1, B:145, 0, 6" "C:FE1, B:50@NE2, 1.8, 2.6" '
+                             '(windows) or --atom_pairs "C:FE1, B:94, 8" (point). Old '
+                             '";"-separated string still works.')
     parser.add_argument('--atom_pair_distogram_loss', type=float, default=1.0,
                         help='Weight for the token-level distogram window loss '
                              'over --atom_pairs (fast-mode safe; ligand atoms '
@@ -372,18 +374,22 @@ Examples:
                              '--distogram_only False; carries a gradient only '
                              'with --attach_coords True (mirrors '
                              '--motif_coords_loss). Inert unless --atom_pairs set.')
-    parser.add_argument('--atom_pair_distogram_loss_type', type=str, default='prob',
-                        choices=['prob', 'expected', 'contact'],
+    parser.add_argument('--atom_pair_distogram_loss_type', type=str, default='expected',
+                        choices=['expected', 'prob', 'contact'],
                         help="How the --atom_pairs distogram restraint is computed: "
-                             "'prob' = -log P(d in [lo,hi]) over the in-window "
-                             "probability mass (original, default); 'expected' = "
-                             "flat-bottom relu(lo-E[d])^2+relu(E[d]-hi)^2 on the "
-                             "expected distance E[d]=sum(prob*mid_pts) (force grows "
-                             "with distance but saturates at the far end); "
-                             "'contact' = BoltzDesign1's own categorical contact "
-                             "loss (cutoff=hi, lo ignored): a robust attractive "
+                             "'expected' (default) = bin-center MSE on the predicted "
+                             "distribution -- for a POINT TARGET (3-field spec, "
+                             "lo=hi=d_ref) this is sum_k p_k * (mid_pts_k - d_ref)^2 "
+                             "(= Var + bias^2, so drives BOTH the expected distance "
+                             "toward d_ref AND the prediction toward a sharp delta "
+                             "there); for a WINDOW (4-field spec, lo < hi) this is "
+                             "the flat-bottom relu(lo-E[d])^2+relu(E[d]-hi)^2 on the "
+                             "expected distance. 'prob' = -log P(d in [lo,hi]) over "
+                             "the in-window probability mass (its gradient collapses "
+                             "by ~20 A). 'contact' = BoltzDesign1's own categorical "
+                             "contact loss (cutoff=hi, lo ignored): a robust attractive "
                              "gradient that is large when far and tapers near -- "
-                             "recommended for pulling a far pair into contact. All "
+                             "use this when pulling a far pair into contact. All "
                              "three are capped by the distogram's ~24.5 A ceiling; "
                              "for a truly unbounded long-range pull use the coord "
                              "loss in full mode (--distogram_only False "

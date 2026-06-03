@@ -18,10 +18,11 @@ design) and writes, into ``<output>/final_loss_plots/`` (a sibling of ``loss/``)
     overlaid point, +/-1 std error bars):
       1. plddt_loss, target_plddt_loss
       2. pae_loss, i_pae_loss
-      3a (Angstrom): rg_loss, motif_coords_loss, sqrt(atom_pair_coords_loss),
-         and sqrt(atom_pair_distogram_loss) when its method is 'expected'
-      3b (dimensionless / cross-entropy): helix_loss, motif_distogram_loss, and
-         atom_pair_distogram_loss when its method is 'prob'/'contact'
+      3a (Angstrom): rg_loss, motif_coords_loss, sqrt(motif_distogram_loss)
+         (bin-center MSE -> A), sqrt(atom_pair_coords_loss), and
+         sqrt(atom_pair_distogram_loss) when its method is 'expected'
+      3b (dimensionless / cross-entropy): helix_loss and atom_pair_distogram_loss
+         when its method is 'prob'/'contact'
       4. total_loss, intra_contact_loss, inter_contact_loss
   * ``final_losses_by_itr.csv`` / ``main_losses_by_itr.csv`` (the plotted data).
 
@@ -247,8 +248,11 @@ def main():
                       "PAE losses", os.path.join(out_dir, "mean_2_pae.png"))
 
         # 3a: linear-Angstrom losses (squared ones are sqrt'd to A).
+        # motif_distogram_loss is bin-center MSE (A^2), so it joins this group
+        # after a sqrt -> A.
         group_a = [("rg_loss", "rg_loss", IDENT),
                    ("motif_coords_loss", "motif_coords_loss", IDENT),
+                   ("motif_distogram_loss", "sqrt(motif_distogram_loss)", SQRT),
                    ("motif_fape_loss", "motif_fape_loss", IDENT),
                    ("atom_pair_coords_loss", "sqrt(atom_pair_coords_loss)", SQRT)]
         if apd_key and apd_method == "expected":
@@ -258,9 +262,8 @@ def main():
                       os.path.join(out_dir, "mean_3a_angstrom.png"))
 
         # 3b: dimensionless cross-entropy / -log losses (helix is the i->i+3
-        # distogram contact CE, same unit as the motif/atom-pair distogram CEs).
-        group_b = [("helix_loss", "helix_loss", IDENT),
-                   ("motif_distogram_loss", "motif_distogram_loss", IDENT)]
+        # distogram contact CE).
+        group_b = [("helix_loss", "helix_loss", IDENT)]
         if apd_key and apd_method in ("prob", "contact"):
             group_b.append((apd_key, apd_key, IDENT))
         plot_mean_bar(comp_per_itr, group_b,

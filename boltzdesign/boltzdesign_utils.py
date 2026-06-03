@@ -877,36 +877,49 @@ def propose_mcmc_move(slide_state, island_lengths, binder_length,
     return None
 
 
-def get_motif_target_distogram(ref_xyz, num_bins=64, device=None):
-    """One-hot target distogram from reference motif coords.
+def get_motif_target_distances(ref_xyz, device=None):
+    """Raw reference pairwise distances from motif coords (A), [M, M].
 
-    Uses Boltz1's native distogram discretization: edges
-    `linspace(2, 22, num_bins-1)`, bin index `(d > edges).sum(-1)`. Faithful to
-    boltz confidence.py:295 and ColabDesign get_dgram_loss
-    (`(dm > bin_edges**2).sum(-1)`), so the one-hot lines up bin-for-bin with
-    Boltz's predicted `pdistogram`.
+    No bin discretization -- callers that need bin-aware loss (e.g.
+    ``get_motif_distogram_loss``) consume these together with the bin
+    midpoints to compute bin-center MSE.
     """
     x = torch.as_tensor(ref_xyz, dtype=torch.float32)
     if device is not None:
         x = x.to(device)
-    d = torch.cdist(x, x)                                  # [M, M]
-    edges = torch.linspace(2.0, 22.0, num_bins - 1, device=x.device)
-    idx = (d.unsqueeze(-1) > edges).sum(-1)                 # [M, M] in [0, 63]
-    return torch.nn.functional.one_hot(idx, num_bins).float()
+    return torch.cdist(x, x)                              # [M, M]
 
 
-def get_motif_distogram_loss(pdistogram, motif_token_idx, target_onehot):
-    """Distogram categorical cross-entropy over motif token pairs.
+def get_motif_distogram_loss(pdistogram, motif_token_idx, target_dist, mid_pts):
+    """Bin-center MSE on the trunk distogram, restricted to motif token pairs.
 
-    Direct port of ColabDesign get_dgram_loss's `loss_fn`:
-    `cce = -(t * log_softmax(p)).sum(-1)`, averaged over all motif×motif pairs.
-    `pdistogram` is the raw predicted logits [1, N, N, num_bins]; we gather the
-    sub-block at the motif token indices so this works with the trunk-only
+    For each motif pair (i, j), compute the expected squared error in bin-center
+    space against the reference pairwise distance:
+
+        L_ij = sum_k p_ijk * (mid_pts_k - target_dist[i, j])^2          [A^2]
+
+    averaged over distinct motif pairs (i != j).
+
+    MSE-style: decomposes as Var(d_k | i,j) + (E[d_k | i,j] - target_dist_ij)^2,
+    so it drives both the expected distance to the reference AND the prediction
+    toward a sharp delta there. Bin-center-aware: putting mass on a near-but-
+    wrong bin is cheap, on a far-wrong bin is expensive (penalty grows with
+    squared bin-center distance from reference). Replaces the previous one-hot
+    categorical CE form, which was bin-membership-only (every wrong bin
+    contributed -log P regardless of how far it was from the right bin) and
+    was sensitive to which bin straddle the reference distance fell into.
+
+    ``pdistogram`` is the raw predicted logits [1, N, N, num_bins]; we gather
+    the sub-block at the motif token indices so this works with the trunk-only
     fast path (distogram_only=True).
     """
     p = pdistogram[0].index_select(0, motif_token_idx).index_select(1, motif_token_idx)
-    cce = -(target_onehot * torch.log_softmax(p, dim=-1)).sum(-1)   # [M, M]
-    return cce.mean()
+    prob = torch.softmax(p, dim=-1)                            # [M, M, num_bins]
+    err2 = (mid_pts.view(1, 1, -1) - target_dist.unsqueeze(-1)) ** 2  # [M, M, num_bins]
+    per_pair = (prob * err2).sum(dim=-1)                       # [M, M], A^2
+    M = motif_token_idx.shape[0]
+    mask = ~torch.eye(M, dtype=torch.bool, device=per_pair.device)
+    return per_pair[mask].mean()
 
 
 def np_kabsch(a, b, return_v=False):
@@ -1101,9 +1114,7 @@ def _kabsch_transform(src, dst):
     ``aligned = (src - src_mean) @ R.T + dst_mean`` is the least-squares fit
     of src onto dst (proper rotation, no chirality flip via the det term).
 
-    Used by both ``kabsch_align`` (differentiable -- motif RMSD wants gradient
-    flow into ``pred``) and ``add_com_loss`` (detached -- see the docstring
-    there for why the fit should NOT carry gradient).
+    Used by both ``kabsch_align`` and ``add_com_loss`` (detached).
     """
     src_mean = src.mean(dim=0, keepdim=True)
     dst_mean = dst.mean(dim=0, keepdim=True)
@@ -1166,25 +1177,14 @@ def add_com_loss(sample_atom_coords, batch, com_sources, binder_chain='A'):
 def kabsch_align(pred, ref):
     """Kabsch alignment of pred onto ref (least-squares, proper rotation).
 
-    The SVD-derived R, p_mean, r_mean are computed under ``torch.no_grad()`` so
-    they're treated as constants. Pred's gradient still flows through the
-    linear rotate/translate apply ``(pred - p_mean) @ R.T + r_mean``.
-
-    This is the right shape because Kabsch is a CLOSED-FORM inner optimum: by
-    the envelope theorem, d(RMSD)/d(pred) is the same whether we propagate
-    through R/t or hold them constant at their optimal values -- the partials
-    of RMSD wrt R, t vanish at the Kabsch fit. The only thing in-graph SVD
-    backward buys us is numerical instability (SVD backward is pathological
-    near degenerate singular values, same risk the ``--deterministic_sampler``
-    flag works around in the diffusion sampler). Off-graph SVD is strictly
-    better here.
-
-    For motif_coords_loss with ligand carry-along, off-graph R/t also
-    suppresses the (physically backwards) gradient that would otherwise push
-    backbone atoms around to "fit the ligand better in the alignment frame".
-    Backbone is now pressured only by backbone_ref; ligand by ligand_ref
-    under the backbone alignment -- the decoupled story the CLAUDE.md note
-    on get_motif_coords_loss describes."""
+    SVD is run under ``torch.no_grad()`` so R/p_mean/r_mean are treated as
+    constants; the linear apply ``(pred - p_mean) @ R.T + r_mean`` is in-graph,
+    so ``pred``'s gradient still flows through the affine transform. By the
+    envelope theorem this gives the same gradient w.r.t. ``pred`` as a fully
+    in-graph SVD would, without the SVD-backward instability (pathological
+    near degenerate singular values, same risk that ``--deterministic_sampler``
+    works around in the diffusion sampler).
+    """
     with torch.no_grad():
         R, p_mean, r_mean = _kabsch_transform(pred, ref)
     return (pred - p_mean) @ R.transpose(-1, -2) + r_mean
@@ -1329,12 +1329,20 @@ def _parse_endpoint(ep):
 def parse_atom_pairs_spec(spec):
     """Parse the --atom_pairs string into raw endpoint dicts (no batch needed).
 
-    Grammar:  "<epA>, <epB>, <lo>, <hi> ; <epA>, <epB>, <lo>, <hi> ; ..."
-    Pairs are separated by ';', with four comma-separated fields each. Each
-    endpoint is CHAIN:SEL[@ATOM]; SEL is a 1-indexed residue position for polymer
-    chains or an atom name for ligand chains, and @ATOM optionally pins a named
-    atom (used by the coord loss; the distogram loss is token/Cb-level). lo/hi
-    are the target distance window in Angstrom.
+    Grammar (per ';'-separated chunk):
+       4 fields -- "<epA>, <epB>, <lo>, <hi>"   window restraint
+       3 fields -- "<epA>, <epB>, <d_ref>"      point-target restraint (lo=hi=d_ref)
+
+    Each endpoint is CHAIN:SEL[@ATOM]; SEL is a 1-indexed residue position for
+    polymer chains or an atom name for ligand chains, and @ATOM optionally pins
+    a named atom (used by the coord loss; the distogram loss is token/Cb-level).
+    Distances are in Angstrom.
+
+    The point-target form is what the 'expected' distogram method turns into the
+    literal SwitchCraft motif loss sum_k p_k (d_k - d_ref)^2 (which decomposes
+    as variance + bias^2 about d_ref, so it both pulls the expected distance to
+    d_ref AND drives the prediction toward a sharp delta there); the window
+    form stays a flat-bottom on the expected distance E[d].
     """
     pairs = []
     for chunk in spec.split(';'):
@@ -1342,16 +1350,20 @@ def parse_atom_pairs_spec(spec):
         if not chunk:
             continue
         fields = [f.strip() for f in chunk.split(',')]
-        if len(fields) != 4:
+        if len(fields) == 4:
+            epA, epB, lo, hi = fields
+            lo, hi = float(lo), float(hi)
+            if hi < lo:
+                raise ValueError(f"atom-pair '{chunk}': hi ({hi}) < lo ({lo})")
+        elif len(fields) == 3:
+            epA, epB, d_ref = fields
+            lo = hi = float(d_ref)
+        else:
             raise ValueError(
-                f"atom-pair '{chunk}' must have 4 comma-separated fields "
-                f"'epA, epB, lo, hi'")
-        epA, epB, lo, hi = fields
+                f"atom-pair '{chunk}' must have 3 fields 'epA, epB, d_ref' "
+                f"(point target) or 4 fields 'epA, epB, lo, hi' (window)")
         cA, sA, aA = _parse_endpoint(epA)
         cB, sB, aB = _parse_endpoint(epB)
-        lo, hi = float(lo), float(hi)
-        if hi < lo:
-            raise ValueError(f"atom-pair '{chunk}': hi ({hi}) < lo ({lo})")
         pairs.append({'chainA': cA, 'selA': sA, 'atomA': aA,
                       'chainB': cB, 'selB': sB, 'atomB': aB,
                       'lo': lo, 'hi': hi})
@@ -1435,30 +1447,40 @@ def resolve_atom_pairs(spec, batch, structure):
 
 
 def get_atom_pair_distogram_loss(pdistogram, pair_specs, mid_pts,
-                                 method='prob', return_stats=False):
+                                 method='expected', return_stats=False):
     """Distogram-based distance restraint over the --atom_pairs token pairs.
-    Two selectable formulations (`method=`):
+    Three selectable formulations (`method=`):
 
+      'expected' (default) -- bin-center MSE on the predicted distribution:
+                    POINT TARGET (lo == hi == d_ref, set by the 3-field spec
+                    "epA, epB, d_ref"):  sum_k p_k * (mid_pts_k - d_ref)^2
+                       -- the literal SwitchCraft motif loss (Eq 1). Equals
+                       Var(d_k) + (E[d_k] - d_ref)^2, so it pulls the expected
+                       distance to d_ref AND drives the prediction toward a sharp
+                       delta at d_ref. Always > 0 unless the prediction is a
+                       perfect delta at d_ref.
+                    WINDOW (lo < hi, 4-field spec "epA, epB, lo, hi"):
+                       relu(lo - E[d])^2 + relu(E[d] - hi)^2 on the expected
+                       distance E[d] = sum(prob * mid_pts). Flat-bottom: zero
+                       once E[d] in [lo, hi]; only the mean is penalized
+                       (variance is invisible). Force grows with distance inside
+                       the resolved range, but the gradient saturates at the
+                       far end (see ceiling note).
       'prob'     -- -log P(d in [lo,hi]): the in-window probability MASS read
-                    from the symmetrized token-pair distribution (original).
-                    No distance ceiling, but can be driven down by parking a
-                    little mass in-window while the bulk of the distribution --
-                    and hence the sampled structure -- stays far away.
-      'expected' -- flat-bottom relu(lo-E[d])^2 + relu(E[d]-hi)^2 on the
-                    expected distance E[d] = sum(prob * mid_pts): optimizes the
-                    ACTUAL predicted distance (the same value that is logged),
-                    zero once E[d] in [lo,hi], mirroring get_atom_pair_coords_loss.
-                    Force grows with distance INSIDE the resolved range, but both
-                    E[d] and its gradient saturate at the far end (see ceiling
-                    note) -- so it is weakest exactly when the pair is far.
+                    from the symmetrized token-pair distribution. Can be driven
+                    down by parking a little mass in-window while the bulk of
+                    the distribution -- and hence the sampled structure -- stays
+                    far away; its gradient also collapses by ~20 A (the eps clamp
+                    + softmax saturation), so it stops pulling exactly when you
+                    need it to.
       'contact'  -- the same objective BoltzDesign1 uses to FORM binder-target
                     contacts: ColabDesign's categorical contact cross-entropy
                     (_get_con_loss, binary=False) with the contact cutoff = hi.
                     A -log-type loss whose gradient is large when the pair is far
                     and tapers as probability moves within hi (i.e. large far,
                     small near -- a robust monotonic "pull them together" force).
-                    One-sided: lo is ignored. Recommended when the pair starts
-                    far apart and you want it driven into contact.
+                    One-sided: lo is ignored. Use when the pair starts far apart
+                    and you want it driven into contact.
 
     Averaged over pairs. Fast-mode safe. Token resolution: ligand atoms exact,
     polymer residues at Cb.
@@ -1483,7 +1505,13 @@ def get_atom_pair_distogram_loss(pdistogram, pair_specs, mid_pts,
         win = ((mid_pts >= s['lo']) & (mid_pts <= s['hi'])).to(prob.dtype)
         p_window = (prob * win).sum()
         if method == 'expected':
-            term = torch.relu(s['lo'] - exp_d) ** 2 + torch.relu(exp_d - s['hi']) ** 2
+            if s['lo'] == s['hi']:                        # point target -> SwitchCraft Eq 1
+                # sum_k p_k * (mid_pts_k - d_ref)^2 = Var(d_k) + (E[d_k] - d_ref)^2
+                # (penalizes both prediction spread AND mean-distance bias).
+                d_ref = s['lo']
+                term = (prob * (mid_pts - d_ref).pow(2)).sum()
+            else:                                         # window -> flat-bottom on E[d]
+                term = torch.relu(s['lo'] - exp_d) ** 2 + torch.relu(exp_d - s['hi']) ** 2
         elif method == 'prob':
             term = -torch.log(p_window + 1e-8)
         elif method == 'contact':
@@ -1671,12 +1699,12 @@ def boltz_hallucination(
     # set, so existing runs are byte-for-byte unchanged. Weights come via
     # loss_scales['atom_pair_distogram_loss'/'atom_pair_coords_loss'].
     atom_pairs='',
-    # How the --atom_pairs distogram restraint is computed: 'prob' (-log P(d in
-    # window), original), 'expected' (flat-bottom on the expected distance), or
-    # 'contact' (BoltzDesign1's categorical contact loss; robust attractive
-    # gradient, large when far / tapering near). See get_atom_pair_distogram_loss.
-    # Default 'prob' reproduces prior behavior.
-    atom_pair_distogram_loss_type='prob',
+    # How the --atom_pairs distogram restraint is computed: 'expected' (default;
+    # bin-center MSE -- SwitchCraft Eq 1 for a point target, flat-bottom on E[d]
+    # for a window), 'prob' (-log P(d in window)), or 'contact' (BoltzDesign1's
+    # categorical contact loss; robust attractive gradient, large when far /
+    # tapering near). See get_atom_pair_distogram_loss.
+    atom_pair_distogram_loss_type='expected',
     # COM loss inputs. Inactive unless an HETATM ORI atom is found in --pdb_path
     # or --motif_pdb. pdb_path: original target PDB whose target chains seed
     # the Kabsch anchor (all non-binder atoms in `structure`). motif_pdb is
@@ -1893,7 +1921,7 @@ def boltz_hallucination(
     #   * sliding (--motif_unindex_residues): per-island starts sampled by
     #     MCMC + simulated annealing each epoch
     # Both contribute to the SAME `motif_token_idx`/`motif_bb_pred_idx`/
-    # `motif_target_onehot`/sequence-pin tensors (fixed entries first, then
+    # `motif_target_dist`/sequence-pin tensors (fixed entries first, then
     # sliding in declaration order). Sliding entries are *dynamic* -- a helper
     # rebuilds them from `slide_state` after every MCMC step.
     motif_active = bool(motif_pdb)
@@ -1909,7 +1937,7 @@ def boltz_hallucination(
     motif_token_idx = None        # LongTensor of token-axis indices (the binder
                                   # residues that hold the motif). Rebuilt per
                                   # epoch when sliding is active.
-    motif_target_onehot = None    # [M, M, 64] reference distogram (CCE target)
+    motif_target_dist = None      # [M, M] raw reference pairwise distances (A)
     motif_onehot = None           # [M, V] hard res_type for sequence pinning
     if motif_active:
         # ----- Shared binder lookup helpers (used by both modes) -----
@@ -2102,8 +2130,8 @@ def boltz_hallucination(
             combined_ref_xyz = slide_ref_xyz
             motif_seq = slide_motif_seq
         M = len(motif_seq)
-        motif_target_onehot = get_motif_target_distogram(
-            combined_ref_xyz, num_bins=64, device=device)
+        motif_target_dist = get_motif_target_distances(
+            combined_ref_xyz, device=device)
         motif_onehot = torch.zeros(M, V, device=device, dtype=batch['res_type'].dtype)
         for j, aa in enumerate(motif_seq):
             col = _AA_TO_COL.get(aa)
@@ -2610,7 +2638,8 @@ def boltz_hallucination(
                 pae_history.append(pae[0].detach().cpu().numpy())
 
             # Motif scaffolding supervised losses (ColabDesign `partial`).
-            #   - `motif_distogram_loss`: trunk-distogram CE (fast-mode safe).
+            #   - `motif_distogram_loss`: bin-center MSE on the trunk distogram
+            #     restricted to motif token pairs (fast-mode safe).
             #   - `motif_coords_loss`:    Kabsch (backbone-only) + RMSD over
             #     backbone (and ligand if --motif_ligand_residues set), full-
             #     mode only; gradient needs --attach_coords True like rg_loss.
@@ -2618,7 +2647,7 @@ def boltz_hallucination(
             #     error (full-mode only; same gating).
             if motif_active:
                 losses['motif_distogram_loss'] = get_motif_distogram_loss(
-                    pdist, motif_token_idx, motif_target_onehot)
+                    pdist, motif_token_idx, motif_target_dist, mid_pts)
                 if (not pre_run and not distogram_only
                         and 'sample_atom_coords' in dict_out):
                     _mloss, _mstats = get_motif_coords_loss(
@@ -3309,7 +3338,7 @@ def run_boltz_design(
                     # Each has its own png + csv, atom_pair distogram column
                     # carries the method suffix so downstream tools can group it.
                     try:
-                        _apd_method = config.get("atom_pair_distogram_loss_type", "prob")
+                        _apd_method = config.get("atom_pair_distogram_loss_type", "expected")
                         _overrides_dist = {
                             'atom_pair_distogram_loss': f'atom_pair_distogram_loss_{_apd_method}',
                         }
@@ -3351,7 +3380,7 @@ def run_boltz_design(
                                    if k.startswith('atom_pair|dist|')]
                         if ap_keys:
                             labels = [k.split('atom_pair|dist|', 1)[1] for k in ap_keys]
-                            _apd_method = config.get("atom_pair_distogram_loss_type", "prob")
+                            _apd_method = config.get("atom_pair_distogram_loss_type", "expected")
 
                             def _win(lab):
                                 m = _re.search(r'\[([-\d.]+),\s*([-\d.]+)\]A\s*$', lab)
@@ -3437,7 +3466,7 @@ def run_boltz_design(
                     # Own try/except (warn only).
                     try:
                         motif_specs = [
-                            ('motif_distogram_loss', 'Motif Distogram Loss (CE)', '#00ddff'),
+                            ('motif_distogram_loss', 'Motif Distogram Loss (bin-center MSE; A^2)', '#00ddff'),
                             ('motif_coords_loss', 'Motif Backbone RMSD (N,CA,C,CB; A)', '#ffaa00'),
                             ('motif_fape_loss', 'Motif Sidechain FAPE (A)', '#ff66aa'),
                         ]
