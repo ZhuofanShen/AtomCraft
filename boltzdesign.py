@@ -488,7 +488,13 @@ def load_boltz_model(args, device):
         "write_full_pde": False,
     }
     
-    boltz_model = get_boltz_model(args.boltz_checkpoint, predict_args, device, use_heun=args.use_heun, attach_coords=args.attach_coords, step_scale=args.step_scale, deterministic_sampler=args.deterministic_sampler, gamma_0=args.gamma_0)
+    # The model is loaded with stock diffusion defaults. Per-run sampler tuning
+    # (use_heun / attach_coords / step_scale / deterministic_sampler / gamma_0 /
+    # sampling_steps / recycling_steps) is applied to the model ONLY for the
+    # design epochs inside boltz_hallucination (via apply_sampler_config); the
+    # final prediction restores these stock defaults. So those knobs flow through
+    # the run config -> boltz_hallucination, not through get_boltz_model.
+    boltz_model = get_boltz_model(args.boltz_checkpoint, predict_args, device)
     boltz_model.train()
     return boltz_model, predict_args
 
@@ -752,7 +758,15 @@ def update_config_with_args(config, args):
 
     advanced_params = {
         'distogram_only': args.distogram_only,
+        # Diffusion-sampler tuning for the design epochs only. These reach the
+        # model via boltz_hallucination's apply_sampler_config(); the final
+        # prediction restores stock Boltz defaults. (recycling_steps /
+        # sampling_steps below are part of the same per-epoch sampler profile.)
         'attach_coords': args.attach_coords,
+        'step_scale': args.step_scale,
+        'gamma_0': args.gamma_0,
+        'use_heun': args.use_heun,
+        'deterministic_sampler': args.deterministic_sampler,
         'design_algorithm': args.design_algorithm,
         'learning_rate': args.learning_rate,
         'learning_rate_pre': args.learning_rate_pre,
@@ -1200,6 +1214,11 @@ def generate_yaml_config(args, config_obj):
                 _chains = get_chains_sequence(pdb_path)
                 for target_id in pdb_target_ids:
                     target.append(_chains[target_id])
+            elif types_list[0] == 'metal':
+                # Metals are emitted as bare CCD codes (e.g. "ZN") by
+                # build_chain_dict; mirrors the multi-target metal branch.
+                for target_mol in target_mols:
+                    target.append(target_mol)
             else:
                 raise ValueError(f"Unsupported target type: {types_list[0]}")
     else:

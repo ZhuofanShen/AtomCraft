@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import subprocess
 import pickle
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 import copy
@@ -1567,14 +1567,83 @@ def get_atom_pair_coords_loss(sample_atom_coords, pair_specs, return_stats=False
     return (loss, stats) if return_stats else loss
 
 
-def get_boltz_model(checkpoint: Optional[str] = None, predict_args=None, device: Optional[str] = None, use_heun: bool = False, attach_coords: bool = False, step_scale: float = 1.638, deterministic_sampler: bool = False, gamma_0: float = 0.605) -> Boltz1:
+@dataclass
+class SamplerConfig:
+    """Diffusion-sampler settings for one forward-pass phase.
+
+    Bundles the per-call ``predict_args`` knobs (recycling / sampling step
+    counts) with the ``AtomDiffusion`` runtime attributes (step_scale, gamma_0,
+    use_heun, deterministic_sampler, attach_coords). Two phases use it:
+
+      * the gradient **design epochs** -- per-run tuning lives here;
+      * the **final prediction** + semi-greedy evals -- stock Boltz defaults.
+
+    The defaults below ARE the stock Boltz defaults (== ``BoltzDiffusionParams``
+    for the sampler attrs, recycling 3 / sampling 200 for the step counts), so
+    ``SamplerConfig()`` is the final-prediction profile and the design profile
+    is built by overriding only the knobs the user set.
+    """
+
+    recycling_steps: int = 3
+    sampling_steps: int = 200
+    step_scale: float = 1.638
+    gamma_0: float = 0.605
+    use_heun: bool = False
+    deterministic_sampler: bool = False
+    attach_coords: bool = False
+    diffusion_samples: int = 1
+    write_confidence_summary: bool = True
+    write_full_pae: bool = False
+    write_full_pde: bool = False
+
+    def predict_args(self) -> dict:
+        """The ``model.predict_args`` dict for this phase (recycling / sampling
+        step counts + writer flags). The sampler attrs are applied separately
+        via :func:`apply_sampler_config` because they live on the module, not
+        in predict_args."""
+        return {
+            "recycling_steps": self.recycling_steps,
+            "sampling_steps": self.sampling_steps,
+            "diffusion_samples": self.diffusion_samples,
+            "write_confidence_summary": self.write_confidence_summary,
+            "write_full_pae": self.write_full_pae,
+            "write_full_pde": self.write_full_pde,
+        }
+
+
+def apply_sampler_config(boltz_model, cfg: SamplerConfig):
+    """Install a :class:`SamplerConfig` onto the model.
+
+    Sets the ``AtomDiffusion`` runtime attributes (read fresh inside
+    ``sample()`` every forward pass, so this takes effect immediately and is
+    fully reversible) and ``model.predict_args``. Returns the predict_args dict
+    for convenience. This is the single point where per-phase sampler settings
+    are switched, so design-epoch tuning never leaks into the final fold.
+    """
+    sm = boltz_model.structure_module
+    sm.step_scale = cfg.step_scale            # eta; 1.0 = velocity-consistent ODE step
+    sm.gamma_0 = cfg.gamma_0                   # EDM churn; 0.0 = noise-free ODE sampler
+    sm.use_heun = cfg.use_heun                 # 2nd-order corrector
+    sm.deterministic_sampler = cfg.deterministic_sampler  # aug/SVD/churn-free for backprop
+    # Drops the sampler's no_grad wrapper; paired with disconnect_coords=False
+    # in confidence_args so gradients reach the confidence head through coords.
+    sm.attach_coords = cfg.attach_coords
+    boltz_model.predict_args = cfg.predict_args()
+    return boltz_model.predict_args
+
+
+def get_boltz_model(checkpoint: Optional[str] = None, predict_args=None, device: Optional[str] = None) -> Boltz1:
+    """Load Boltz1 with **stock** diffusion defaults.
+
+    Per-run sampler tuning is no longer baked in here: the design loop installs
+    its settings via :func:`apply_sampler_config` for the gradient epochs and
+    restores these stock defaults before the final prediction. Keeping the model
+    at stock defaults means any forward pass that bypasses the design loop (e.g.
+    the final fold) uses the validated Boltz sampler.
+    """
     torch.set_grad_enabled(True)
     torch.set_float32_matmul_precision("highest")
     diffusion_params = BoltzDiffusionParams()
-    diffusion_params.step_scale = step_scale  # Sampler over-relaxation / step length (eta); 1.0 = velocity-consistent ODE step
-    diffusion_params.gamma_0 = gamma_0  # EDM churn; 0.0 = noise-free ODE sampler for stable few-step inference
-    diffusion_params.use_heun = use_heun
-    diffusion_params.deterministic_sampler = deterministic_sampler  # Aug/SVD/churn-free sampler for backprop
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
         strict=False,
@@ -1586,9 +1655,6 @@ def get_boltz_model(checkpoint: Optional[str] = None, predict_args=None, device:
         no_msa=False,
         no_atom_encoder=False,
     )
-    # Toggle off the sampler's no_grad wrapper. Paired with disconnect_coords=False
-    # in confidence_args so gradients reach the confidence head through coords.
-    model_module.structure_module.attach_coords = attach_coords
     return model_module
 
 
@@ -1601,8 +1667,16 @@ def boltz_hallucination(
     length=100,
     binder_chain='A',
     design_algorithm="3stages",
+    # Diffusion-sampler settings for the gradient DESIGN EPOCHS only. They are
+    # installed on the model for the design loop via apply_sampler_config(); the
+    # semi-greedy evals + final prediction restore stock Boltz defaults. Defaults
+    # here mirror the stock values so an unset knob == stock behavior.
     recycling_steps=0,
     sampling_steps=200,
+    step_scale=1.638,
+    gamma_0=0.605,
+    use_heun=False,
+    deterministic_sampler=False,
     pre_iteration=20,
     soft_iteration=50, 
     soft_iteration_1=50,
@@ -1719,16 +1793,21 @@ def boltz_hallucination(
     intermediate_dir=None,
 ):
 
-    predict_args = {
-        "recycling_steps": recycling_steps,  # Default value
-        "sampling_steps": sampling_steps,  # Total diffusion step count
-        "diffusion_samples": 1,  # Default value
-        "write_confidence_summary": True,
-        "write_full_pae": False,
-        "write_full_pde": False,
-    }
-
-    boltz_model.predict_args = predict_args
+    # Sampler profile for the gradient design epochs. Installed on the model now
+    # (the design-loop forwards read these) and reused for nothing else: the
+    # semi-greedy evals + final prediction restore stock defaults (final_sampler
+    # below). predict_args drives the design() calls' confidence_args; attach_coords
+    # is read directly from the closure in get_model_loss for disconnect_coords.
+    design_sampler = SamplerConfig(
+        recycling_steps=recycling_steps,
+        sampling_steps=sampling_steps,
+        step_scale=step_scale,
+        gamma_0=gamma_0,
+        use_heun=use_heun,
+        deterministic_sampler=deterministic_sampler,
+        attach_coords=attach_coords,
+    )
+    predict_args = apply_sampler_config(boltz_model, design_sampler)
 
     with yaml_path.open("r") as file:
         data = yaml.safe_load(file)
@@ -1832,10 +1911,16 @@ def boltz_hallucination(
         return grad * torch.sqrt(torch.tensor(eff_L)) / (gn + 1e-7)
 
     alphabet = list('XXARNDCQEGHILKMFPSTWYV-')
-    best_loss = float('inf')  
-    min_loss = float('inf') 
-    best_batch = None     
+    best_loss = float('inf')
+    min_loss = float('inf')
+    best_batch = None
     first_step_best_batch=None
+
+    # stage_name -> last-epoch argmax sequence string for the binder chain.
+    # Populated after each design() call in the algorithm branches below;
+    # consumed after final_sampler is applied to write {stage}_last.pdb into
+    # intermediate_dir (always-on, independent of save_intermediate_structures).
+    stage_lasts = {}
 
     plots = []
     distogram_history = []
@@ -2551,8 +2636,18 @@ def boltz_hallucination(
                     continue
                 t_mask = target_masks[ti]
                 if optimize_contact_per_binder_pos_pt[ti]:
-                    n_pos = (0 if (pre_run and increasing_contact_over_itr)
-                             else num_optimizing_binder_pos)
+                    # Per-binder-position contact objective (count from the binder
+                    # side: mask_1d=chain_mask). num_pos selects how many binder
+                    # positions must contact this target. Faithful to the original
+                    # boltz_hallucination: a FINITE num_pos (the annealed schedule)
+                    # is used ONLY when increasing_contact_over_itr is on; otherwise
+                    # num_pos stays inf so every binder position counts. Note
+                    # increasing_contact_over_itr and num_optimizing_binder_pos are
+                    # GLOBAL (not per-target) -- only the optimize flag is per-target.
+                    if increasing_contact_over_itr:
+                        n_pos = 0 if pre_run else num_optimizing_binder_pos
+                    else:
+                        n_pos = float("inf")
                     li = get_con_loss(pdist, mid_pts,
                                       num=num_inter_contacts_pt[ti], seqsep=0,
                                       num_pos=n_pos,
@@ -2829,7 +2924,18 @@ def boltz_hallucination(
                 optimizer.zero_grad()
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"Epoch {i}: lr: {current_lr:.3f}, soft: {opt['soft']:.2f}, hard: {opt['hard']:.2f}, temp: {opt['temp']:.2f}, total loss: {total_loss.item():.2f}, {loss_str}")
-        
+
+        # Snapshot the last-epoch argmax sequence for this stage; outer block
+        # re-folds at stock sampler and writes {stage}_last.pdb. Only stages
+        # that actually ran (iters>0) are captured -- an iters=0 no-op would
+        # otherwise alias the previous stage's sequence.
+        if iters > 0:
+            stage_lasts[stage_name] = ''.join([
+                alphabet[k] for k in torch.argmax(
+                    batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:],
+                    dim=-1).detach().cpu().numpy()
+            ])
+
         return batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list
 
     if pre_run:
@@ -2936,15 +3042,8 @@ def boltz_hallucination(
     # visualize_results(plots)
 
     if pre_run:
-        predict_args = {
-        "recycling_steps": 3,  # Default value
-        "sampling_steps": sampling_steps,  # Total diffusion step count
-        "diffusion_samples": 1,  # Default value
-        "write_confidence_summary": True,
-        "write_full_pae": True,
-        "write_full_pde": False,
-        }
-
+        # Warm-up returns the logits only; no final fold runs here, so no
+        # predict_args/sampler change is needed.
         best_logits = batch['res_type_logits']
         best_seq = ''.join([alphabet[i] for i in torch.argmax(batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
         data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = best_seq
@@ -2958,16 +3057,15 @@ def boltz_hallucination(
         else:
             best_batch = batch  
 
-    # Per-epoch optimization-loop predict args (consumed by confidence_args in
-    # get_model_loss). Cheap on purpose so the inner loop fits in memory.
-    predict_args = {
-        "recycling_steps": recycling_steps,
-        "sampling_steps": sampling_steps,
-        "diffusion_samples": 1,
-        "write_confidence_summary": True,
-        "write_full_pae": False,
-        "write_full_pde": False,
-    }
+    # Restore stock Boltz sampler defaults for everything past the design loop.
+    # The semi-greedy MCMC evals AND the final folds all run this full 200-step
+    # stochastic sampler (step_scale 1.638, gamma_0 0.605, no Heun, coords
+    # detached) -- matching the original boltz_hallucination, where semi-greedy
+    # and the final prediction share one predict_args. Per-run design tuning
+    # (deterministic_sampler / step_scale / sampling_steps / attach_coords / ...)
+    # never reaches this point.
+    final_sampler = SamplerConfig(write_full_pae=True)
+    final_predict_args = apply_sampler_config(boltz_model, final_sampler)
 
     def _mutate(sequence, best_logits, i_prob):
         mutated_sequence = list(sequence) # Create a copy of the input tensor
@@ -2996,19 +3094,68 @@ def boltz_hallucination(
         best_batch_apo = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in best_batch_apo.items()}
         return best_batch, best_batch_apo, best_structure, best_structure_apo
 
-    # Stand-alone final structural validation. Deliberately decoupled from the
-    # per-epoch optimization knobs so the final fold is a fixed,
-    # well-conditioned prediction regardless of how cheap/heavy the
-    # optimization-loop forwards were.
-    final_predict_args = {
-        "recycling_steps": 3,
-        "sampling_steps": 200,
-        "diffusion_samples": 1,
-        "write_confidence_summary": True,
-        "write_full_pae": True,
-        "write_full_pde": False,
-    }
+    def _dump_pdb_to_intermediate(out_name, coords, plddt, structure_obj):
+        """Write coords + plddt to intermediate_dir/<out_name>, restoring the
+        structure object's atoms/is_present afterwards. No-op if
+        intermediate_dir is None."""
+        if intermediate_dir is None:
+            return
+        try:
+            os.makedirs(intermediate_dir, exist_ok=True)
+            n_atoms = structure_obj.atoms['coords'].shape[0]
+            coords_np = coords[:n_atoms, :]
+            saved_coords = structure_obj.atoms['coords'].copy()
+            saved_present = structure_obj.atoms['is_present'].copy()
+            try:
+                structure_obj.atoms['coords'] = coords_np
+                structure_obj.atoms['is_present'] = True
+                with open(os.path.join(intermediate_dir, out_name), 'w') as _f:
+                    _f.write(to_pdb(structure_obj, plddts=plddt))
+            finally:
+                structure_obj.atoms['coords'] = saved_coords
+                structure_obj.atoms['is_present'] = saved_present
+        except Exception as _e:
+            print(f"[stage_last] save failed for {out_name}: "
+                  f"{type(_e).__name__}: {_e}")
 
+    # Stage-last PDB dump (always-on; independent of save_intermediate_structures).
+    # For each stage that actually ran (iters>0), re-fold its last-epoch argmax
+    # sequence at the stock final sampler and write {stage}_last.pdb. The current
+    # `data` already carries the LAST stage's sequence (best_seq set above), so
+    # we temporarily swap in each stage's sequence and restore afterwards so the
+    # seed fold + semi-greedy code below see unchanged `data`.
+    if intermediate_dir is not None and stage_lasts:
+        _saved_data_seq = data['sequences'][chain_to_number[binder_chain]]['protein']['sequence']
+        try:
+            for _stage_name, _stage_seq in stage_lasts.items():
+                try:
+                    data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = _stage_seq
+                    _stage_target = parse_boltz_schema(name, data, ccd_lib)
+                    _stage_batch, _stage_structure = get_batch(
+                        _stage_target, msa_max_seqs, length, keep_record=True)
+                    _stage_batch = {k: v.unsqueeze(0).to(device) if k != 'record' else v
+                                    for k, v in _stage_batch.items()}
+                    _stage_out = _run_model(boltz_model, _stage_batch, final_predict_args)
+                    # predict_step returns the coords under key 'coords' (it
+                    # renames the model's `sample_atom_coords` for the writer).
+                    if _stage_out is None or 'coords' not in _stage_out:
+                        print(f"[stage_last] fold unavailable for "
+                              f"{_stage_name}_last.pdb; skipping")
+                        continue
+                    _coords = _stage_out['coords'][0].detach().cpu().numpy()
+                    _plddt = (_stage_out['plddt'][0].detach().cpu().numpy()
+                              if 'plddt' in _stage_out else None)
+                    _dump_pdb_to_intermediate(
+                        f"{_stage_name}_last.pdb", _coords, _plddt, _stage_structure)
+                except Exception as _e:
+                    print(f"[stage_last] failure for {_stage_name}: "
+                          f"{type(_e).__name__}: {_e}")
+        finally:
+            data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = _saved_data_seq
+
+    # final_predict_args / final_sampler were installed above (stock defaults);
+    # all folds from here on -- the seed fold, the semi-greedy per-mutation evals
+    # and the post-semi-greedy fold -- use them.
     best_batch, best_batch_apo, best_structure, best_structure_apo = _update_batches(data, data_apo)
     output = _run_model(boltz_model, best_batch, final_predict_args)
     output_apo = _run_model(boltz_model, best_batch_apo, final_predict_args)
@@ -3034,7 +3181,7 @@ def boltz_hallucination(
             mutated_sequence = _mutate(prev_sequence, best_logits, i_prob)
             data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = mutated_sequence
             best_batch, _, _, _ = _update_batches(data, data_apo)
-            output = _run_model(boltz_model, best_batch, predict_args)
+            output = _run_model(boltz_model, best_batch, final_predict_args)
             if output is None:
                 print(f"[semi-greedy] step {step} epoch {t}: fold failed; "
                       f"aborting semi-greedy with histories collected.")
@@ -3067,6 +3214,19 @@ def boltz_hallucination(
             # not the cheaper per-mutation eval settings used inside the loop.
             output = _run_model(boltz_model, best_batch, final_predict_args)
             output_apo = _run_model(boltz_model, best_batch_apo, final_predict_args)
+
+            # semi_greedy_last.pdb: dump the post-semi-greedy fold so it sits
+            # alongside soft_last.pdb / temp_last.pdb / hard_last.pdb under
+            # intermediate_dir. Only fires when semi-greedy actually ran
+            # (semi_greedy_steps>0) and the fold succeeded.
+            # predict_step returns the coords under key 'coords' (it renames
+            # the model's `sample_atom_coords` for the writer).
+            if output is not None and 'coords' in output:
+                _coords = output['coords'][0].detach().cpu().numpy()
+                _plddt = (output['plddt'][0].detach().cpu().numpy()
+                          if 'plddt' in output else None)
+                _dump_pdb_to_intermediate(
+                    "semi_greedy_last.pdb", _coords, _plddt, best_structure)
 
     return output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo, distogram_history, sequence_history, loss_history, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list, traj_plddt_list, structure, loss_component_history, plddt_history, pae_history
 
@@ -3155,7 +3315,10 @@ def run_boltz_design(
     loss_dir = os.path.join(version_dir, 'loss')
     animation_save_dir = os.path.join(version_dir, 'animation')
     fasta_dir = os.path.join(version_dir, 'fasta')
-    intermediate_structures_root = os.path.join(version_dir, 'intermediate_structures') if save_intermediate_structures else None
+    # Always create the intermediate_structures root: it holds the always-on
+    # {stage}_last.pdb / semi_greedy_last.pdb dumps regardless of
+    # save_intermediate_structures (which only gates per-epoch dumps).
+    intermediate_structures_root = os.path.join(version_dir, 'intermediate_structures')
 
     _dirs_to_make = [results_yaml_dir, results_final_dir, results_yaml_dir_apo, results_final_dir_apo, loss_dir, animation_save_dir, fasta_dir]
     if intermediate_structures_root is not None:
