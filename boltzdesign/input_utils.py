@@ -357,7 +357,7 @@ def build_chain_dict(targets: list, target_type, binder_id: str, constraints: di
         
     return chain_dict, yaml_target_ids
 
-def generate_yaml_for_target_binder(name:str, target_type, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False) -> dict:
+def generate_yaml_for_target_binder(name:str, target_type, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False, msa_paths: dict = None) -> dict:
     """
     Generate YAML content for a small molecule binder with multiple targets and create the YAML file.
     
@@ -374,6 +374,12 @@ def generate_yaml_for_target_binder(name:str, target_type, targets: list, config
         modifications (dict): Optional modifications to add to YAML
         modification_target (str): Optional modification target to add to YAML
         use_msa (bool): Whether to use MSA for proteins
+        msa_paths (dict): Optional {chain_id: path} mapping of pre-existing MSAs
+            to use INSTEAD of generating via the ColabFold server, for protein
+            target chains. Each path may be a folder (expects msa.npz and/or
+            msa.a3m inside) or a direct .npz / .a3m file; a missing .npz is
+            derived from the .a3m automatically. Only consulted when use_msa is
+            True; chains absent from the mapping fall back to server generation.
         
     Returns:
         tuple: YAML content dictionary and output path
@@ -403,14 +409,24 @@ def generate_yaml_for_target_binder(name:str, target_type, targets: list, config
                 }
             }
         else:  # protein
-            msa_path = (config.MSA_DIR / f"{name}_{chain_id}_env/msa.npz" 
-                       if use_msa and not all(x == 'X' for x in info['sequence']) 
-                       else "empty")
-
-            if msa_path != "empty":
+            # MSA source priority for a protein chain:
+            #   1. use_msa False OR designable binder (all-X) -> "empty" (single-seq)
+            #   2. a pre-existing MSA supplied via msa_paths[chain_id] -> use it
+            #      directly (no ColabFold call, no overwrite)
+            #   3. otherwise -> auto-generate at MSA_DIR/{name}_{chain}_env/msa.npz
+            is_binder = all(x == 'X' for x in info['sequence'])
+            provided = (msa_paths or {}).get(chain_id)
+            if not use_msa or is_binder:
+                msa_path = "empty"
+            elif provided is not None:
+                msa_path = resolve_provided_msa(provided, chain_id)
+                logger.info(f"Using provided MSA for {name} chain {chain_id}: {msa_path}")
+                print(f"[MSA] chain {chain_id}: using provided MSA -> {msa_path}")
+            else:
+                msa_path = config.MSA_DIR / f"{name}_{chain_id}_env/msa.npz"
                 process_msa(chain_id, info['sequence'], name, config)
                 print(f"Processed MSA for {name} chain {chain_id}")
-            
+
             entry = {
                 "protein": {
                     "id": [chain_id],
@@ -438,27 +454,34 @@ def generate_yaml_for_target_binder(name:str, target_type, targets: list, config
 
     
 def process_msa(chain_id: str, sequence: str, pdb_code: str, config: Config) -> bool:
-    """Process MSA for a single chain."""
+    """Process MSA for a single chain.
+
+    Cache-respecting: an existing msa.a3m is reused verbatim (no ColabFold call,
+    so a hand-curated alignment is never clobbered), and msa.npz is only built
+    when missing. A run only hits the network when neither file is present.
+    """
     msa_chain_dir = config.MSA_DIR / f"{pdb_code}_{chain_id}"
     env_dir = msa_chain_dir.with_name(f"{msa_chain_dir.name}_env")
-    env_dir.mkdir(exist_ok=True)
-    
-    # Run MSA
-    unpaired_msa = run_mmseqs2(
-        [sequence],
-        str(msa_chain_dir),
-        use_env=True,
-        use_pairing=False,
-        host_url="https://api.colabfold.com",
-        pairing_strategy="greedy"
-    )
-    
-    # Save MSA results
+    env_dir.mkdir(parents=True, exist_ok=True)
+
     msa_a3m_path = env_dir / "msa.a3m"
-    msa_a3m_path.write_text(unpaired_msa[0])
-    
-    # Process MSA if not already processed
     msa_npz_path = env_dir / "msa.npz"
+
+    # Only query the ColabFold MMseqs2 server when there is no a3m on disk yet.
+    if not msa_a3m_path.exists():
+        unpaired_msa = run_mmseqs2(
+            [sequence],
+            str(msa_chain_dir),
+            use_env=True,
+            use_pairing=False,
+            host_url="https://api.colabfold.com",
+            pairing_strategy="greedy"
+        )
+        msa_a3m_path.write_text(unpaired_msa[0])
+    else:
+        logger.info(f"Reusing existing a3m for {pdb_code} chain {chain_id}: {msa_a3m_path}")
+
+    # Build the processed .npz only if it is not already there.
     if not msa_npz_path.exists():
         msa = parse_a3m(
             msa_a3m_path,
@@ -466,6 +489,58 @@ def process_msa(chain_id: str, sequence: str, pdb_code: str, config: Config) -> 
             max_seqs=4096,
         )
         msa.dump(msa_npz_path)
-    
+
     logger.info(f"Processed MSA for {pdb_code} chain {chain_id}")
     return True
+
+
+def resolve_provided_msa(path, chain_id: str = "?", max_seqs: int = 4096) -> str:
+    """Resolve a user-supplied MSA location to the .npz path that goes in the YAML.
+
+    `path` may be:
+      * a directory   -> uses <dir>/msa.npz and <dir>/msa.a3m
+      * a .npz file    -> used as-is; the sibling .a3m (same stem) is expected
+      * a .a3m file    -> the sibling .npz (same stem) is derived from it
+
+    The .npz (consumed by the design loop via np.load) is created from the .a3m
+    when absent. The .a3m must sit at the same stem as the .npz because the
+    final boltz-predict step rewrites the YAML msa path .npz -> .a3m; if it is
+    missing a warning is emitted (only matters with --redo_boltz_predict True).
+    Returns the absolute .npz path as a string.
+    """
+    p = Path(os.path.abspath(os.path.expanduser(str(path))))
+    if p.is_dir():
+        npz_path = p / "msa.npz"
+        a3m_path = p / "msa.a3m"
+    elif p.suffix == ".npz":
+        npz_path = p
+        a3m_path = p.with_suffix(".a3m")
+    elif p.suffix == ".a3m":
+        a3m_path = p
+        npz_path = p.with_suffix(".npz")
+    else:
+        # No recognised suffix: treat as a directory (lets users pass an env dir
+        # path that does not yet exist only if it actually contains the files).
+        npz_path = p / "msa.npz"
+        a3m_path = p / "msa.a3m"
+
+    if not npz_path.exists():
+        if a3m_path.exists():
+            logger.info(f"Deriving {npz_path} from {a3m_path} (chain {chain_id})")
+            msa = parse_a3m(a3m_path, taxonomy=None, max_seqs=max_seqs)
+            npz_path.parent.mkdir(parents=True, exist_ok=True)
+            msa.dump(npz_path)
+        else:
+            raise FileNotFoundError(
+                f"--msa_paths for chain {chain_id}: neither {npz_path} nor "
+                f"{a3m_path} exists. Provide a folder containing msa.npz/msa.a3m, "
+                f"or a direct .npz/.a3m file.")
+
+    if not a3m_path.exists():
+        msg = (f"[MSA] chain {chain_id}: {a3m_path} is missing. The design loop "
+               f"will still run from {npz_path.name}, but --redo_boltz_predict "
+               f"True needs the .a3m at the same stem for the final prediction.")
+        logger.warning(msg)
+        print(msg)
+
+    return str(npz_path)
