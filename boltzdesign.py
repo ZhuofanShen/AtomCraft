@@ -4,10 +4,7 @@ import argparse
 import yaml
 import json
 import shutil
-import pickle
-import glob
 import numpy as np
-import random
 import logging
 import subprocess
 import pandas as pd
@@ -23,6 +20,8 @@ from alphafold_utils import *
 from input_utils import *
 from utils import *
 import torch
+
+from Bio.PDB import PDBParser, MMCIFParser
 
 
 # Configure logging
@@ -107,6 +106,18 @@ Examples:
                         help='Binder chain ID')
     parser.add_argument('--use_msa', type=str2bool, default=False,
                         help='Use MSA (if False, runs in single-sequence mode)')
+    parser.add_argument('--msa_paths', type=str, nargs='+', default=[],
+                        help='Use pre-existing MSA(s) instead of generating them '
+                             'via the ColabFold server. Chain-prefixed CHAIN:PATH '
+                             'tokens, one per target protein chain, e.g. '
+                             '--msa_paths B:/abs/path/to/4YQX_B_env. PATH may be a '
+                             'folder (expects msa.npz and/or msa.a3m inside) or a '
+                             'direct .npz / .a3m file; a missing msa.npz is derived '
+                             'from msa.a3m automatically. A bare path with no '
+                             'CHAIN: prefix is accepted when there is exactly one '
+                             'protein target. Only applies when --use_msa True; '
+                             'target chains not listed fall back to server '
+                             'generation.')
     parser.add_argument('--msa_max_seqs', type=int, default=4096,
                         help='Maximum MSA sequences')
     parser.add_argument('--suffix', type=str, default='0',
@@ -209,6 +220,20 @@ Examples:
                              "confidence-head losses (plddt/pae/i_pae) backprop through the "
                              "diffusion sampler. Only meaningful when distogram_only=False; "
                              "increases memory/compute substantially.")
+    parser.add_argument('--disconnect_feats_structure', type=str2bool, default=True,
+                        help="Detach s_inputs going into the diffusion sampler, cutting the "
+                             "trunk-bypassing s_inputs gradient route from sampled coords back "
+                             "to the sequence (leaves the through-trunk s/z route intact). "
+                             "Independent of --disconnect_feats (which gates only the confidence "
+                             "head). Only matters with --distogram_only False --attach_coords True. "
+                             "Default True (disconnected).")
+    parser.add_argument('--disconnect_pairformer_structure', type=str2bool, default=False,
+                        help="Detach s_trunk/z_trunk going into the diffusion sampler, cutting the "
+                             "through-trunk gradient route from sampled coords back to the sequence "
+                             "(leaves the s_inputs route intact). Independent of "
+                             "--disconnect_pairformer (which gates only the confidence head). Only "
+                             "matters with --distogram_only False --attach_coords True. "
+                             "Default False (connected).")
     parser.add_argument('--design_algorithm', type=str, choices=['3stages', '3stages_extra'], 
                         default='3stages', help='Design algorithm')
     parser.add_argument('--learning_rate', type=float, default=0.1,
@@ -235,7 +260,63 @@ Examples:
                              'YAML default (ppi/na/pep: 2; sm: 1; metal: 4).')
     parser.add_argument('--num_intra_contacts', type=int, default=2,
                         help='Number of intra-chain (binder-internal) contacts. Singular.')
-    
+
+    # Inter-chain epitope targeting. Restrict WHICH target residues are visible
+    # to the inter-chain losses, independently for the contact term and the PAE
+    # term. Chain-prefixed, 1-indexed residue positions within the target chain
+    # (same CHAIN:RESNUM convention as --contact_residues / --atom_pairs polymer
+    # selectors), ranges allowed. A target chain NOT named keeps its full
+    # sequence for that loss, so a subset on one chain never masks the others.
+    # Polymer targets only (1 token == 1 residue); for small_molecule/metal
+    # targets toggle the whole term with --i_con_loss / --i_pae_loss = 0 instead.
+    parser.add_argument('--i_con_target_residues', type=str, nargs='+', default=[],
+                        help='Restrict which TARGET residues are visible to the '
+                             'inter-chain CONTACT loss (--i_con_loss / '
+                             '--num_inter_contacts). Chain-prefixed, 1-indexed '
+                             'positions within the target chain, ranges allowed: '
+                             '--i_con_target_residues B:50-70 B:95 C:1-10. A target '
+                             'chain not listed uses its full sequence (legacy). '
+                             'Old "B:50-70,B:95" comma form also works.')
+    parser.add_argument('--i_pae_target_residues', type=str, nargs='+', default=[],
+                        help='Restrict which TARGET residues are visible to the '
+                             'inter-chain PAE loss (--i_pae_loss). Same '
+                             'CHAIN:RESNUM / CHAIN:start-end syntax as '
+                             '--i_con_target_residues; independent selection. '
+                             'Unlisted chains use their full sequence.')
+
+    # Auxiliary INTER-TARGET interactions. Optimize contacts / interface-PAE
+    # BETWEEN two target chains (not the binder), computed with the SAME loss
+    # functions as the binder<->target i_con_loss / i_pae_loss and added as
+    # separate, separately-plotted terms. Each pair token is
+    # "<sideA> | <sideB>" (also "<sideA> and <sideB>" / "<sideA> vs <sideB>");
+    # each side is one or more CHAIN:RESNUM / CHAIN:start-end selections
+    # (comma/space separated), both sides target chains. Quote each pair.
+    parser.add_argument('--inter_target_con_pairs', type=str, nargs='+', default=[],
+                        help='Inter-target residue pairs whose CONTACTS to '
+                             'optimize, e.g. --inter_target_con_pairs '
+                             '"B:45-47 | C:52" "B:103 | D:82-91,D:98". Uses the '
+                             'same contact loss as i_con_loss; weight set by '
+                             '--inter_target_con_loss, hyperparameters by '
+                             '--inter_target_num_contacts / --inter_target_cutoff. '
+                             'Empty => no inter-target contact term.')
+    parser.add_argument('--inter_target_pae_pairs', type=str, nargs='+', default=[],
+                        help='Inter-target residue pairs whose INTERFACE PAE to '
+                             'optimize, e.g. --inter_target_pae_pairs '
+                             '"B:45-47 | C:52" "B:103 | D:82-91,D:98". Uses the '
+                             'same PAE loss as i_pae_loss; weight set by '
+                             '--inter_target_pae_loss. Independent of '
+                             '--inter_target_con_pairs (pass the same pairs in '
+                             'both to optimize contacts AND PAE for a pair). '
+                             'Empty => no inter-target PAE term.')
+    parser.add_argument('--inter_target_num_contacts', type=int, default=2,
+                        help='Min contacts per query residue for the inter-target '
+                             'contact loss (the get_con_loss `num`, mirroring '
+                             '--num_inter_contacts). Default 2.')
+    parser.add_argument('--inter_target_cutoff', type=float, default=14.0,
+                        help='Distance cutoff (Angstrom) for the inter-target '
+                             'contact loss (mirroring --inter_chain_cutoff). '
+                             'Default 14.0.')
+
 
     # loss parameters
     parser.add_argument('--con_loss', type=float, default=1.0,
@@ -253,6 +334,14 @@ Examples:
                         help='Per-target inter-chain PAE loss weight. One value per '
                              '--target_types entry; length 1 broadcasts. Unset => 0.1 for '
                              'every target (reproduces the prior global default).')
+    parser.add_argument('--inter_target_con_loss', type=float, default=1.0,
+                        help='Weight (loss scale) for the auxiliary inter-target '
+                             'CONTACT loss (--inter_target_con_pairs). Default 1.0, '
+                             'matching the i_con_loss scale. 0 disables it.')
+    parser.add_argument('--inter_target_pae_loss', type=float, default=0.1,
+                        help='Weight (loss scale) for the auxiliary inter-target '
+                             'interface-PAE loss (--inter_target_pae_pairs). '
+                             'Default 0.1, matching the i_pae_loss scale. 0 disables it.')
     parser.add_argument('--rg_loss', type=float, default=0.3,
                         help='Radius of gyration loss weight (default 0.3, matching '
                              'BindCraft weights_rg / use_rg_loss=true). Only contributes '
@@ -281,29 +370,48 @@ Examples:
                         help='Maximum helix loss weights')
     parser.add_argument('--helix_loss_min', type=float, default=-0.3,
                         help='Minimum helix loss weights')
-    parser.add_argument('--motif_distogram_loss', type=float, default=1.0,
+    parser.add_argument('--motif_distogram_loss', type=float, default=0.0,
                         help='Motif scaffolding distogram-CCE loss weight '
                              '(ColabDesign `partial` dgram_cce). Only used when '
-                             '--motif_pdb is set. Formerly --motif_loss.')
-    parser.add_argument('--motif_coords_loss', type=float, default=1.0,
+                             '--motif_pdb is set. Default 0 (off) -- opt in '
+                             'explicitly. Formerly --motif_loss.')
+    parser.add_argument('--motif_coords_loss', type=float, default=0.0,
                         help='Motif scaffolding coord-RMSD loss weight. Kabsch-'
                              'aligned RMSD on the sampled atom coords; the rigid '
-                             'transform is fit from the protein motif backbone '
-                             '(N,CA,C,CB) ONLY, then applied to any ligand atoms '
-                             'specified by --motif_ligand_residues (decoupled '
-                             'alignment), and the combined RMSD is the optimized '
-                             'scalar. Active only when --motif_pdb is set AND '
-                             '--distogram_only False (needs sample_atom_coords). '
-                             'Carries a gradient only with --attach_coords True; '
-                             'otherwise reported but inert, mirroring --rg_loss.')
-    parser.add_argument('--motif_fape_loss', type=float, default=1.0,
-                        help='Motif scaffolding sidechain FAPE loss weight '
-                             '(AlphaFold-style frame-aligned point error of motif '
-                             'sidechain atoms in the motif backbone frames). Active '
-                             'only when --motif_pdb is set AND --distogram_only '
-                             'False AND shared sidechain heavy atoms exist (the '
-                             'binder is built as UNK, so by default only CB/CG). '
-                             'Gradient only with --attach_coords True.')
+                             'transform is fit from the SELECTED protein motif '
+                             'atoms ONLY (the per-residue :ATOMS selection of '
+                             '--motif_residues; backbone N,CA,C,CB by default), '
+                             'then applied to any ligand atoms specified by '
+                             '--motif_ligand_residues (decoupled alignment, ligand '
+                             'never in the fit), and the combined RMSD is the '
+                             'optimized scalar. The Kabsch SVD is detached (no '
+                             'backprop through the alignment). Active only when '
+                             '--motif_pdb is set AND --distogram_only False (needs '
+                             'sample_atom_coords). Carries a gradient only with '
+                             '--attach_coords True; otherwise reported but inert, '
+                             'mirroring --rg_loss. Default 0 (off) -- opt in '
+                             'explicitly.')
+    parser.add_argument('--motif_fape_loss', type=float, default=0.0,
+                        help='Motif scaffolding FAPE loss weight (AlphaFold-style '
+                             'frame-aligned point error of motif atoms in the motif '
+                             'backbone frames). DEFAULT 0 (off). Scores exactly the '
+                             ':ATOMS selection of --motif_residues / '
+                             '--motif_unindex_residues (default N,CA,C,CB) -- the '
+                             'SAME atoms as --motif_coords_loss; backbone atoms are '
+                             'included if selected (no automatic skip). The frame '
+                             'still needs N,CA,C per residue. Active only when '
+                             '--motif_pdb is set AND --distogram_only False; '
+                             'gradient only with --attach_coords True.')
+    parser.add_argument('--motif_distogram_loss_type', type=str,
+                        default='cross_entropy', choices=['cross_entropy', 'mse'],
+                        help="How the motif distogram restraint is computed: "
+                             "'cross_entropy' (default) = one-hot categorical "
+                             "cross-entropy supervised by the motif ground-truth "
+                             "Cβ-Cβ distance bin, -mean over off-diagonal motif "
+                             "pairs (same diagonal/symmetry convention as the "
+                             "con/i_con contact losses; no distance cutoff). "
+                             "'mse' = bin-center MSE sum_k p_k (mid_pts_k - "
+                             "d_ref)^2. Only used when --motif_pdb is set.")
 
     # Motif scaffolding (ColabDesign `partial` protocol). Design a binder that
     # also retains a given structural motif (e.g. a catalytic/cofactor-binding
@@ -316,14 +424,69 @@ Examples:
                              'residue/range, e.g. --motif_residues A57 A102 A195 (or '
                              'A10-14 B57 C195 for multi-chain). Each token is '
                              'CHAIN+RESNUM (author/PDB) in the motif PDB, ranges '
-                             'allowed. Bare residue numbers are rejected -- prefix '
-                             'the chain. One-to-one with --motif_binder_positions in '
-                             'declaration order. Old "A57,A102,A195" form still works.')
+                             'allowed. An optional :ATOMS suffix picks which atoms '
+                             'of that residue enter the motif_coords AND motif_fape '
+                             'losses (the SAME atoms drive alignment + loss for '
+                             'both): A47:SG (one atom), B53:CA,C (named atoms), '
+                             'C1:ALL (every heavy atom); no suffix = default set '
+                             'N,CA,C,CB. Backbone atoms are included if you list '
+                             'them (e.g. A38:N,CA,C,O,CB) -- nothing is skipped '
+                             'automatically. A bare integer between two residue '
+                             'tokens is a FIXED-GAP spacer: "A38:CB 3 A42:CB" keeps '
+                             'A38 and A42 separated by 3 residues. With :ATOMS, '
+                             'separate residue tokens with SPACES (commas group '
+                             'atoms ONLY inside :ATOMS; comma-separated residue '
+                             'lists are not accepted). Bare residue numbers are '
+                             'rejected -- prefix the chain. One-to-one with '
+                             '--motif_binder_positions in declaration order.')
     parser.add_argument('--motif_binder_positions', type=str, nargs='+', default=[],
                         help='1-indexed binder positions the motif maps to (same count/'
                              'order as --motif_residues), e.g. --motif_binder_positions '
-                             '30 75 110. Default: N-terminal contiguous block. Old '
-                             '"30,75,110" form still works.')
+                             '30 75 110. Default: islands laid out N-terminally, '
+                             'honoring any fixed-gap spacers (so "A38 3 A42" -> binder '
+                             'positions 1 and 5). Old "30,75,110" form still works.')
+    parser.add_argument('--motif_unindex_residues', type=str, nargs='+', default=[],
+                        help='Sliding-window motif residues whose binder positions '
+                             'are NOT pre-specified -- they are sampled by MCMC + '
+                             'simulated annealing each epoch (Metropolis on the '
+                             'backbone Kabsch RMSD). SAME grammar as --motif_residues '
+                             '(CHAIN+RESNUM[:ATOMS], ranges, :ATOMS, fixed-gap '
+                             'spacers). Residues are grouped into rigid sliding '
+                             'ISLANDS: a fixed-gap spacer ("A38:CB 3 A42:CB" -> one '
+                             'island, A38 & A42 four positions apart) or a '
+                             'consecutive run/range (A38-40) stays in one island; a '
+                             'chain change or non-consecutive gap with no spacer '
+                             'starts a new island. E.g. "A38 3 A42 A170" -> island '
+                             '[A38,A42] + island [A170]. Coexists with '
+                             '--motif_residues (fixed positions are excluded from '
+                             'sliding placements). Feeds the distogram, coords AND '
+                             'FAPE motif losses (FAPE pred indices rebuilt per epoch '
+                             'from the placement). MCMC tuning uses '
+                             'boltz_hallucination defaults.')
+    parser.add_argument('--motif_slide_method', type=str, default='mcmc',
+                        choices=['mcmc', 'exhaustive'],
+                        help='How --motif_unindex_residues islands are placed on '
+                             'the binder. "mcmc" (default): Metropolis + simulated '
+                             'annealing search on the coords Kabsch RMSD (full mode). '
+                             '"exhaustive": deterministic placement by exhaustive '
+                             'triplet enumeration (motif_enum), scored by the '
+                             '--motif_slide_loss determinant (distogram every '
+                             'epoch; rmsd/fape need full-mode coords and support '
+                             'only the default backbone selection). '
+                             'No effect without --motif_unindex_residues.')
+    parser.add_argument('--motif_slide_loss', type=str, default='distogram',
+                        choices=['distogram', 'rmsd', 'fape'],
+                        help='The DETERMINANT score the placement search (MCMC or '
+                             'exhaustive) uses to rank --motif_unindex_residues '
+                             'placements -- one type, not a blend. "distogram" '
+                             '(default): trunk Cβ-distogram CE -- the only choice '
+                             'available every (fast-mode) epoch, so the placement '
+                             'tracks the design throughout. "rmsd"/"fape": coords '
+                             'Kabsch-RMSD / frame-aligned error -- need the diffusion '
+                             'sampler, so the placement only updates on full-mode '
+                             'epochs (--distogram_only False). Independent of the '
+                             'motif_*_loss GRADIENT weights (which may be combined '
+                             'freely). No effect without --motif_unindex_residues.')
     parser.add_argument('--fix_motif_seq', type=str2bool, default=True,
                         help='Pin the motif residues to the reference sequence '
                              '(retained + grad-frozen). False = scaffold '
@@ -333,9 +496,12 @@ Examples:
                              'along with the motif under --motif_coords_loss, one '
                              'token per residue: --motif_ligand_residues B1 (or '
                              'B1 C401). Each is CHAIN+RESNUM (author/PDB) in the '
-                             'motif PDB. The Kabsch transform is fit on the protein '
-                             'motif backbone (unchanged by this flag), then applied '
-                             'to these ligand heavy atoms so their RMSD reports their '
+                             'motif PDB, with an optional :ATOMS suffix (B1:FE,N1 / '
+                             'C1:ALL) selecting which ligand atoms are carried; no '
+                             'suffix = all heavy atoms. The Kabsch transform is fit '
+                             'on the selected protein motif atoms (never on ligand '
+                             'atoms), then applied to these ligand heavy atoms so '
+                             'their RMSD reports their '
                              'placement RELATIVE to the motif framework -- the '
                              'natural objective for hemoprotein scaffolding. '
                              'Predicted ligand is matched in the designed system by '
@@ -354,9 +520,9 @@ Examples:
                         help='Distance restraints, one pair per token. Two forms: '
                              '4-field WINDOW "epA, epB, lo, hi" (flat-bottom in [lo,hi]) '
                              'or 3-field POINT "epA, epB, d_ref" (treated as lo=hi=d_ref; '
-                             'with --atom_pair_distogram_loss_type expected this becomes '
-                             'the bin-center MSE sum_k p_k * (mid_pts_k - d_ref)^2 on the '
-                             'predicted distogram). Each endpoint is CHAIN:SEL[@ATOM]: '
+                             'under the default --atom_pair_distogram_loss_type cross_entropy '
+                             'this is the one-hot CE -log P(bin(d_ref)) on the predicted '
+                             'distogram). Each endpoint is CHAIN:SEL[@ATOM]: '
                              'SEL is a 1-indexed residue position for polymer chains or an '
                              'atom name for ligand chains; @ATOM pins a named atom (coord '
                              'loss only). All distances in Angstrom. Examples: '
@@ -374,26 +540,53 @@ Examples:
                              '--distogram_only False; carries a gradient only '
                              'with --attach_coords True (mirrors '
                              '--motif_coords_loss). Inert unless --atom_pairs set.')
-    parser.add_argument('--atom_pair_distogram_loss_type', type=str, default='expected',
-                        choices=['expected', 'prob', 'contact'],
+    parser.add_argument('--atom_pair_distogram_loss_type', type=str, default='cross_entropy',
+                        choices=['cross_entropy', 'expected', 'contact'],
                         help="How the --atom_pairs distogram restraint is computed: "
-                             "'expected' (default) = bin-center MSE on the predicted "
-                             "distribution -- for a POINT TARGET (3-field spec, "
-                             "lo=hi=d_ref) this is sum_k p_k * (mid_pts_k - d_ref)^2 "
-                             "(= Var + bias^2, so drives BOTH the expected distance "
-                             "toward d_ref AND the prediction toward a sharp delta "
-                             "there); for a WINDOW (4-field spec, lo < hi) this is "
-                             "the flat-bottom relu(lo-E[d])^2+relu(E[d]-hi)^2 on the "
-                             "expected distance. 'prob' = -log P(d in [lo,hi]) over "
-                             "the in-window probability mass (its gradient collapses "
-                             "by ~20 A). 'contact' = BoltzDesign1's own categorical "
-                             "contact loss (cutoff=hi, lo ignored): a robust attractive "
-                             "gradient that is large when far and tapers near -- "
-                             "use this when pulling a far pair into contact. All "
-                             "three are capped by the distogram's ~24.5 A ceiling; "
-                             "for a truly unbounded long-range pull use the coord "
-                             "loss in full mode (--distogram_only False "
+                             "'cross_entropy' (default) = categorical cross-entropy "
+                             "against the target distance -- for a POINT TARGET "
+                             "(3-field spec, lo=hi=d_ref) this is the one-hot CE "
+                             "-log softmax(logits)[bin(d_ref)] (all mass onto the "
+                             "reference bin); for a WINDOW (4-field spec, lo < hi) "
+                             "this is -log P(d in [lo,hi]) over the in-window "
+                             "probability mass (gradient collapses by ~20 A). This "
+                             "is the former 'prob' method, extended to point targets. "
+                             "'expected' = bin-center MSE -- POINT TARGET sum_k p_k * "
+                             "(mid_pts_k - d_ref)^2 (= Var + bias^2, drives BOTH the "
+                             "expected distance to d_ref AND a sharp delta there); "
+                             "WINDOW flat-bottom relu(lo-E[d])^2+relu(E[d]-hi)^2 on "
+                             "the expected distance. 'contact' = BoltzDesign1's own "
+                             "categorical contact loss (cutoff=hi, lo ignored): a "
+                             "robust attractive gradient that is large when far and "
+                             "tapers near -- use this when pulling a far pair into "
+                             "contact. All are capped by the distogram's ~24.5 A "
+                             "ceiling; for a truly unbounded long-range pull use the "
+                             "coord loss in full mode (--distogram_only False "
                              "--attach_coords True). Inert unless --atom_pairs set.")
+
+    # Explicit three-atom angle restraints. The angle analogue of --atom_pairs;
+    # usable between ANY atoms across ANY chains. Coords-only (an angle is
+    # undefined on the trunk distogram), so it needs full mode + --attach_coords.
+    parser.add_argument('--atom_angles', type=str, nargs='+', default=[],
+                        help='Angle restraints, one A-B-C angle per token (vertex '
+                             'at the MIDDLE endpoint). Two forms: 5-field WINDOW '
+                             '"epA, epB, epC, lo, hi" (flat-bottom in [lo,hi] deg) '
+                             'or 4-field POINT "epA, epB, epC, a_ref" (lo=hi=a_ref). '
+                             'Each endpoint is CHAIN:SEL[@ATOM] exactly as in '
+                             '--atom_pairs (SEL = 1-indexed residue for polymers / '
+                             'atom name for ligands; @ATOM pins a named atom). '
+                             'Angles in degrees (0..180). Examples: '
+                             '--atom_angles "C:FE1, B:50@NE2, B:94@NE2, 80, 110" '
+                             '(window) or --atom_angles "B:10@CA, B:11@CA, B:12@CA, 120" '
+                             '(point). Coords-only: active with --distogram_only '
+                             'False; gradient only with --attach_coords True. '
+                             'Old ";"-separated string also works.')
+    parser.add_argument('--atom_angle_coords_loss', type=float, default=1.0,
+                        help='Weight for the atom-level angle restraint over '
+                             '--atom_angles (flat-bottom, RMS violation in degrees). '
+                             'Active only with --distogram_only False; carries a '
+                             'gradient only with --attach_coords True (mirrors '
+                             '--atom_pair_coords_loss). Inert unless --atom_angles set.')
 
 
     # LigandMPNN parameters
@@ -606,6 +799,45 @@ def get_target_chain_ids(args):
     return letters[:len(types_list)]
 
 
+def parse_msa_paths(tokens, target_chain_ids, types_list):
+    """Parse --msa_paths CHAIN:PATH tokens into {chain_id: absolute_path}.
+
+    A token "B:/abs/path" maps chain B to that path. A bare token "/abs/path"
+    (no CHAIN: prefix) is accepted only when there is exactly one protein target
+    chain, in which case it maps to that chain. PATH is expanded to an absolute
+    path (the design loop and final boltz-predict may run from different cwds).
+    Tokens are NOT split on whitespace/commas (paths may contain them); pass one
+    nargs token per chain. Returns {} for an empty/None token list.
+    """
+    toks = [t for t in (tokens or []) if t and str(t).strip()]
+    if not toks:
+        return {}
+    protein_chains = [c for c, t in zip(target_chain_ids, types_list)
+                      if t == 'protein']
+    out = {}
+    for tok in toks:
+        tok = str(tok).strip()
+        chain = path = None
+        if ':' in tok:
+            head, rest = tok.split(':', 1)
+            if head.strip() in target_chain_ids:   # genuine CHAIN: prefix
+                chain, path = head.strip(), rest.strip()
+        if chain is None:                            # bare-path shorthand
+            if len(protein_chains) != 1:
+                raise ValueError(
+                    f"--msa_paths token {tok!r} has no CHAIN: prefix and there "
+                    f"are {len(protein_chains)} protein target chain(s) "
+                    f"{protein_chains}; prefix it, e.g. "
+                    f"{(protein_chains[0] if protein_chains else 'B')}:{tok}")
+            chain, path = protein_chains[0], tok
+        if not path:
+            raise ValueError(f"--msa_paths: empty path for chain {chain}")
+        if chain in out:
+            raise ValueError(f"--msa_paths: chain {chain} specified more than once")
+        out[chain] = os.path.abspath(os.path.expanduser(path))
+    return out
+
+
 # Per-target settings sourced from the per-type default YAML. Each entry is
 # (cli-flag attribute name on args, key inside the YAML file). The user's CLI
 # value -- if provided -- wins; otherwise the YAML for each target's type is
@@ -682,6 +914,29 @@ def derive_per_target_settings(args, work_dir):
     return settings
 
 
+def derive_metric_config(args, work_dir):
+    """Standardized final-fold metric settings from per-target-type DEFAULT configs
+    (ignoring the run's CLI overrides), so the final con/i_con/helix loss values
+    compare across differently-tuned runs (see compute_final_metrics). Inter-contact
+    settings are per target (each target's type default); intra/helix settings come
+    from the protein (binder) default config."""
+    types_list = get_all_target_types(args)
+    cache = {}
+    def cfg(t):
+        if t not in cache:
+            cache[t] = load_design_config(t, work_dir)
+        return cache[t]
+    binder_cfg = cfg('protein')
+    return {
+        'num_inter_contacts': [cfg(t)['num_inter_contacts'] for t in types_list],
+        'inter_chain_cutoff': [cfg(t)['inter_chain_cutoff'] for t in types_list],
+        'optimize_contact_per_binder_pos':
+            [cfg(t)['optimize_contact_per_binder_pos'] for t in types_list],
+        'num_intra_contacts': binder_cfg['num_intra_contacts'],
+        'intra_chain_cutoff': binder_cfg['intra_chain_cutoff'],
+    }
+
+
 def load_design_config(target_type, work_dir):
     """
     Load design configuration based on target type.
@@ -742,6 +997,24 @@ def update_config_with_args(config, args):
     # pre-feature runs.
     'pdb_path': args.pdb_path,
     'com_loss_weight': args.com_loss,
+    # Inter-chain epitope-targeting selections, normalized to a single space-
+    # separated string each (parsed into per-target token masks inside
+    # boltz_hallucination, mirroring how motif_residues is stored/parsed).
+    # _split_csv flattens the nargs list and the legacy comma form; the ':' /
+    # '-' inside tokens survive (it only splits on commas/whitespace). Empty
+    # string => full sequence for every target (inert, legacy behavior).
+    'i_con_target_residues': " ".join(_split_csv(args.i_con_target_residues)),
+    'i_pae_target_residues': " ".join(_split_csv(args.i_pae_target_residues)),
+    # Auxiliary inter-target pair specs passed through as LISTS of pair-strings
+    # (NOT _split_csv'd: commas separate residue selections WITHIN a side, and
+    # '|'/'and' separate the two sides, so each nargs token is one pair and must
+    # stay intact). Parsed into per-pair token masks inside boltz_hallucination.
+    # num/cutoff are the contact-term hyperparameters; the per-loss WEIGHTS are
+    # added to loss_scales in run_boltz_design_step, not here.
+    'inter_target_con_pairs': list(args.inter_target_con_pairs),
+    'inter_target_pae_pairs': list(args.inter_target_pae_pairs),
+    'inter_target_num_contacts': args.inter_target_num_contacts,
+    'inter_target_cutoff': args.inter_target_cutoff,
     }
     # Per-target settings: user CLI lists (with length-1 broadcast) win;
     # otherwise pulled from the per-type default YAML for each target.
@@ -763,6 +1036,10 @@ def update_config_with_args(config, args):
         # prediction restores stock Boltz defaults. (recycling_steps /
         # sampling_steps below are part of the same per-epoch sampler profile.)
         'attach_coords': args.attach_coords,
+        # Independent sampler-side grad-flow gates (vs. the confidence-head-only
+        # disconnect_feats/disconnect_pairformer, which stay YAML-controlled).
+        'disconnect_feats_structure': args.disconnect_feats_structure,
+        'disconnect_pairformer_structure': args.disconnect_pairformer_structure,
         'step_scale': args.step_scale,
         'gamma_0': args.gamma_0,
         'use_heun': args.use_heun,
@@ -792,12 +1069,22 @@ def update_config_with_args(config, args):
         # Re-emit the list-valued nargs="+" flags as the legacy comma/`;`-separated
         # strings the downstream parsers in boltzdesign_utils consume (parse_motif_*,
         # parse_atom_pairs_spec). This keeps the parser surface in utils unchanged.
-        'motif_residues': ",".join(_split_csv(args.motif_residues)),
+        # Space-joined (NOT _split_csv'd): commas are reserved for the ':ATOMS'
+        # suffix (e.g. "B53:CA,C"), so residue tokens are whitespace-separated and
+        # comma-separated residue lists are rejected by parse_motif_residue_spec.
+        'motif_residues': " ".join(args.motif_residues),
         'motif_binder_positions': ",".join(_split_csv(args.motif_binder_positions)),
+        # Shares the --motif_residues grammar (whitespace tokens, :ATOMS, fixed-gap
+        # spacers) -> space-joined, parsed by parse_motif_islands_spec.
+        'motif_unindex_residues': " ".join(args.motif_unindex_residues),
+        'motif_slide_method': args.motif_slide_method,
+        'motif_slide_loss': args.motif_slide_loss,
         'fix_motif_seq': args.fix_motif_seq,
-        'motif_ligand_residues': ",".join(_split_csv(args.motif_ligand_residues)),
+        'motif_ligand_residues': " ".join(args.motif_ligand_residues),
+        'motif_distogram_loss_type': args.motif_distogram_loss_type,
         'atom_pairs': "; ".join(_split_semi(args.atom_pairs)),
         'atom_pair_distogram_loss_type': args.atom_pair_distogram_loss_type,
+        'atom_angles': "; ".join(_split_semi(args.atom_angles)),
     }
 
     for param_name, param_value in advanced_params.items():
@@ -822,18 +1109,28 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         'i_pae_loss': 1.0,
         'rg_loss': args.rg_loss,
         'com_loss': args.com_loss,
+        # Auxiliary inter-target losses: single global scale each (the per-pair
+        # sum happens inside get_model_loss). 0 disables the term cleanly.
+        'inter_target_con_loss': args.inter_target_con_loss,
+        'inter_target_pae_loss': args.inter_target_pae_loss,
         'target_plddt_loss': 1.0,
         'motif_distogram_loss': args.motif_distogram_loss,
         'motif_coords_loss': args.motif_coords_loss,
         'motif_fape_loss': args.motif_fape_loss,
         'atom_pair_distogram_loss': args.atom_pair_distogram_loss,
         'atom_pair_coords_loss': args.atom_pair_coords_loss,
+        'atom_angle_coords_loss': args.atom_angle_coords_loss,
     }
     
     boltz_path = shutil.which("boltz")
     if boltz_path is None:
         raise FileNotFoundError("The 'boltz' command was not found in the system PATH.")
-    
+
+    # Per-target-type-default contact settings for the standardized final-fold
+    # metrics (independent of this run's CLI tuning), so loss metrics compare
+    # across runs.
+    metric_config = derive_metric_config(args, args.work_dir or os.getcwd())
+
     run_boltz_design(
         boltz_path=boltz_path,
         main_dir=main_dir,
@@ -848,6 +1145,7 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         save_trajectory=args.save_trajectory,
         save_intermediate_structures=args.save_intermediate_structures,
         redo_boltz_predict=args.redo_boltz_predict,
+        metric_config=metric_config,
     )
     
     print("Boltz design step completed!")
@@ -948,6 +1246,40 @@ def filter_high_confidence_designs(args, ligandmpnn_dir, lmpnn_redesigned_dir, l
     if successful_designs == 0:
         print("Error: No LigandMPNN/ProteinMPNN redesigned designs passed the confidence thresholds")
         sys.exit(1)
+
+
+def get_CA_and_sequence(structure_file, chain_id='A'):
+    # Determine file type and use appropriate parser
+    if structure_file.endswith('.cif'):
+        parser = MMCIFParser(QUIET=True)
+    elif structure_file.endswith('.pdb'):
+        parser = PDBParser(QUIET=True)
+    else:
+        raise ValueError("File must be either .cif or .pdb format")
+        
+    structure = parser.get_structure("structure", structure_file)
+    xyz = []
+    sequence = []
+    aa_map = {
+        'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D',
+        'CYS': 'C', 'GLU': 'E', 'GLN': 'Q', 'GLY': 'G',
+        'HIS': 'H', 'ILE': 'I', 'LEU': 'L', 'LYS': 'K',
+        'MET': 'M', 'PHE': 'F', 'PRO': 'P', 'SER': 'S',
+        'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
+    }
+    
+    model = structure[0]  # Get first model (default for most structures)
+    
+    if chain_id in model:
+        chain = model[chain_id]
+        for residue in chain:
+            if "CA" in residue:
+                xyz.append(residue["CA"].coord)
+                sequence.append(aa_map.get(residue.resname, 'X'))
+    else:
+        raise ValueError(f"Chain {chain_id} not found in {structure_file}")
+    
+    return xyz, sequence
 
 
 def calculate_holo_apo_rmsd(af_pdb_dir, af_pdb_dir_apo, binder_chain):
@@ -1233,6 +1565,18 @@ def generate_yaml_config(args, config_obj):
     # str (broadcast) for single-type, per-target list for multi-type.
     target_types_arg = types_list if multi else types_list[0]
 
+    # Pre-existing MSA folders/files keyed by target chain. Parsed against the
+    # same chain-letter assignment generate_yaml_for_target_binder uses, then
+    # forwarded so those chains skip ColabFold generation. Only effective with
+    # --use_msa True; warn (don't silently drop) if provided without it.
+    msa_paths = parse_msa_paths(args.msa_paths, get_target_chain_ids(args), types_list)
+    if msa_paths and not args.use_msa:
+        logger.warning(
+            "--msa_paths was provided but --use_msa is False; ignoring the "
+            "provided MSA(s) and running single-sequence. Pass --use_msa True "
+            "to use them.")
+        msa_paths = {}
+
     return generate_yaml_for_target_binder(
         args.target_name,
         target_types_arg,
@@ -1242,7 +1586,8 @@ def generate_yaml_config(args, config_obj):
         constraints=constraints,
         modifications=modifications['data'] if modifications else None,
         modification_target=modifications['target'] if modifications else None,
-        use_msa=args.use_msa
+        use_msa=args.use_msa,
+        msa_paths=msa_paths
     )
 
 def setup_pipeline_config(args):
