@@ -89,6 +89,10 @@ class MotifPlacementProblem:
                  contig_valid_starts=None):
         self.refs = [torch.as_tensor(r, dtype=torch.float32) for r in contig_refs]
         self.M = len(self.refs)
+        # Keep the index tensors (offsets/starts) on the same device as the refs
+        # so direct users like ``_overlap_mask`` stay device-consistent (the refs
+        # may be built on cuda while the lists below default to CPU).
+        _dev = self.refs[0].device if self.M else torch.device("cpu")
         self.L = int(length)
         if self.M < 1:
             raise ValueError("need at least one contig")
@@ -108,7 +112,7 @@ class MotifPlacementProblem:
             off = [int(o) for o in off]
             if len(off) != self.lengths[c]:
                 raise ValueError(f"contig {c}: offsets length != ref length")
-            self.offsets.append(torch.as_tensor(off, dtype=torch.long))
+            self.offsets.append(torch.as_tensor(off, dtype=torch.long, device=_dev))
             self.spans.append(max(off) + 1)
 
         if contig_valid_starts is None:
@@ -118,7 +122,7 @@ class MotifPlacementProblem:
             raise ValueError("contig_valid_starts must have one entry per contig")
         self.starts = []
         for c, st in enumerate(contig_valid_starts):
-            st = torch.as_tensor([int(s) for s in st], dtype=torch.long)
+            st = torch.as_tensor([int(s) for s in st], dtype=torch.long, device=_dev)
             if st.numel() == 0:
                 raise ValueError(f"contig {c} has no valid start positions")
             if int(st.min()) < 0 or int(st.max()) + self.spans[c] > self.L:
