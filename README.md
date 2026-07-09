@@ -42,6 +42,46 @@ Run the complete pipeline from BoltzDesign to LigandMPNN/ProteinMPNN redesign an
 Examle for small molecule:
 python boltzdesign.py --target_name 7v11 --target_type small_molecule --target_mols OQO --gpu_id 0 --design_samples 2 --suffix 1
 
+Example for motif scaffolding via back-propagating through the structure-based RMSD/FAPE losses and Rg losses:
+python boltzdesign.py \
+    --target_name HEME \
+    --pdb_path peroxidase_pos1-rot1.pdb \
+    --target_types small_molecule \
+    --target_mols HEM \
+    --num_inter_contacts 3 --num_intra_contacts 2 \
+    --distogram_only False --deterministic_sampler True \
+    --use_heun False --sampling_steps 10 --step_scale 1.0 \
+    --attach_coords True --rg_loss 0.3 \
+    --target_plddt_loss 0.1 \
+    --motif_pdb peroxidase_pos1-rot1.pdb \
+    --motif_unindex_residues A38:N,CA,C,O,CB 3 A42:N,CA,C,O,CB A170:N,CA,C,O,CB \
+    --motif_ligand_residues "B201:ALL" \
+    --fix_motif_seq True --motif_coords_loss 0.3 \
+    --motif_slide_method exhaustive --motif_slide_loss rmsd \
+    --design_samples 50 \
+    --suffix coords_10det_rg03_motif-exhaustive-coords-03 \
+    --gpu_id 6
+
+
+python boltzdesign.py \
+    --target_name HEME \
+    --pdb_path peroxidase_pos1-rot1.pdb \
+    --target_types small_molecule \
+    --target_mols HEM \
+    --num_inter_contacts 3 --num_intra_contacts 2 \
+    --distogram_only False --deterministic_sampler True \
+    --use_heun False --sampling_steps 10 --step_scale 1.0 \
+    --attach_coords True --rg_loss 0.3 \
+    --target_plddt_loss 0.1 \
+    --motif_pdb peroxidase_pos1-rot1.pdb \
+    --motif_unindex_residues A38:N,CA,C,O,CB 3 A42:N,CA,C,O,CB A170:N,CA,C,O,CB \
+    --motif_ligand_residues "B201:ALL" \
+    --fix_motif_seq True --motif_fape_loss 0.3 \
+    --motif_slide_method exhaustive --motif_slide_loss fape \
+    --design_samples 50 \
+    --suffix coords_10det_rg03_motif-exhaustive-fape-03 \
+    --gpu_id 7
+
 Example for DNA/RNA PDB design:
 python boltzdesign.py --target_name 5zmc --target_type dna --pdb_target_ids C,D --gpu_id 0 --design_samples 5 --suffix 1
 
