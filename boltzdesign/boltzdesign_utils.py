@@ -1,15 +1,13 @@
 import os
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import subprocess
 import pickle
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 import copy
+import math
 import random
-from boltz.data import const
 from boltz.data.types import MSA, Connection, Input, Structure, Interface
 from boltz.model.model import Boltz1
 from boltz.main import BoltzDiffusionParams
@@ -18,13 +16,13 @@ from boltz.data.feature.featurizer import BoltzFeaturizer
 from boltz.data.parse.schema import parse_boltz_schema
 from boltz.data.write.mmcif import to_mmcif
 from boltz.data.write.pdb import to_pdb
+from loss_functions import get_mid_points, align_points, np_rmsd, parse_motif_ligand_spec, extract_motif_ligand_atoms, parse_motif_residue_spec, extract_motif_coords, parse_residue_spec, extract_motif_residue_atoms, _rigid_frames, parse_motif_islands_spec, island_length, random_valid_placement, get_motif_target_distances, _placement_to_positions, propose_mcmc_move, _find_named_atom, resolve_atom_pairs, resolve_atom_angles, parse_pdb_ori_atoms, _get_helix_loss, get_con_loss, get_plddt_loss, get_pae_loss, get_ca_coords, add_rg_loss, add_com_loss, get_motif_distogram_loss, get_motif_coords_loss, get_motif_fape_loss, kabsch_align, get_atom_pair_distogram_loss, get_atom_pair_coords_loss, get_atom_angle_coords_loss
+from plot_utils import _LOSS_GROUPS, _plot_loss_group, _atom_pair_subplot_augments, _atom_angle_subplot_augments, plot_total_loss_history, visualize_training_history
+from final_metrics import compute_final_metrics, save_metrics_json
 import yaml
 import shutil
-from Bio.PDB import PDBParser, MMCIFParser  
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
-from matplotlib.animation import FuncAnimation
 from IPython.display import HTML, display
 import csv
 import gc
@@ -147,1424 +145,6 @@ chain_to_number = {
     'I': 8,
     'J': 9,
 }
-# Loss-history categorization for the per-iteration plots. Each tuple is
-# (series_key in loss_component_history, plot label, color). Series with no
-# data this run are silently skipped so a single-target / fast-mode run
-# doesn't waste panel space on inert losses.
-_LOSS_GROUPS = {
-    'distogram': [
-        ('con_loss',                 'Intra-Contact Loss',        '#ff3366'),
-        ('i_con_loss',               'Inter-Contact Loss',        '#3366ff'),
-        ('helix_loss',               'Helix Loss',                '#ffaa00'),
-        ('motif_distogram_loss',     'Motif Distogram Loss',      '#aa66ff'),
-        ('atom_pair_distogram_loss', 'Atom-Pair Distogram Loss',  '#66ffcc'),
-    ],
-    'confidence': [
-        ('plddt_loss',        'pLDDT Loss',         '#00ff99'),
-        ('pae_loss',          'PAE Loss',           '#3366ff'),
-        ('i_pae_loss',        'Interface PAE Loss', '#ff3366'),
-        ('target_plddt_loss', 'Target pLDDT Loss',  '#66ffcc'),
-    ],
-    'coords': [
-        ('rg_loss',               'Rg Loss',                '#cc66ff'),
-        ('com_loss',              'COM Loss',               '#ff9933'),
-        ('motif_coords_loss',     'Motif Coords RMSD',      '#aa66ff'),
-        ('motif_bb_rmsd',         'Motif BB RMSD',          '#66aaff'),
-        ('motif_lig_rmsd',        'Motif Ligand RMSD',      '#ffaa66'),
-        ('motif_fape_loss',       'Motif FAPE Loss',        '#cc99ff'),
-        ('atom_pair_coords_loss', 'Atom-Pair Coords Loss',  '#66ffcc'),
-    ],
-}
-
-
-def _plot_loss_group(history, group_specs, png_path, csv_path, suptitle,
-                     csv_col_overrides=None):
-    """Plot one category as a horizontal row of subplots (per-loss y-axis, NOT
-    shared) into a single figure, and write a matching CSV.
-
-    history          : dict mapping series_key -> list of floats (per logged step)
-    group_specs      : list of (series_key, label, color); skipped if no data.
-    csv_col_overrides: optional {series_key: csv_column_name} (used to rename
-                       atom_pair_distogram_loss to include the active method).
-    """
-    import matplotlib.pyplot as _plt
-    present = [(k, lbl, c) for k, lbl, c in group_specs if history.get(k)]
-    if not present:
-        return False
-    _plt.style.use('dark_background')
-    n = len(present)
-    fig, axes = _plt.subplots(1, n, figsize=(4 * n, 4))
-    if n == 1:
-        axes = [axes]
-    fig.patch.set_facecolor('#1C1C1C')
-    for ax, (k, lbl, c) in zip(axes, present):
-        ax.plot(history[k], color=c, linewidth=2)
-        ax.set_xlabel('Logged Steps', fontsize=12)
-        ax.set_ylabel(lbl, fontsize=12)
-        ax.set_title(lbl, fontsize=12, pad=10)
-        ax.grid(True, linestyle='--', alpha=0.3)
-    fig.suptitle(suptitle, fontsize=14, color='white')
-    _plt.tight_layout(pad=3.0, rect=(0, 0, 1, 0.96))
-    _plt.savefig(png_path, facecolor='#1C1C1C', edgecolor='none',
-                 bbox_inches='tight', dpi=300)
-    _plt.close(fig)
-    # Matching CSV (one row per logged step; shorter series blank-padded).
-    overrides = csv_col_overrides or {}
-    n_steps = max(len(history[k]) for k, _, _ in present)
-    with open(csv_path, 'w', newline='') as f:
-        import csv as _csv
-        w = _csv.writer(f)
-        w.writerow(['step'] + [overrides.get(k, k) for k, _, _ in present])
-        for t in range(n_steps):
-            row = [t]
-            for k, _, _ in present:
-                s = history[k]
-                row.append(f'{s[t]:.4f}' if t < len(s) else '')
-            w.writerow(row)
-    return True
-
-
-def visualize_training_history(best_batch, loss_history, sequence_history, distogram_history, length, binder_chain='A', save_dir=None, save_filename=None, plddt_history=None, pae_history=None):
-    """
-    Visualize training history including distogram, sequence, pLDDT, and PAE
-    evolution animations.
-    Args:
-        loss_history (list): List of loss values over training
-        sequence_history (list): List of sequence probability matrices over training
-        distogram_history (list): List of distogram matrices over training
-        length (int): Length of sequence to visualize
-        save_dir (str): Directory to save visualizations
-        plddt_history (list|None): Per-epoch per-token pLDDT vectors (full mode
-            only; None/empty -> pLDDT animation skipped).
-        pae_history (list|None): Per-epoch symmetric PAE matrices in A (full
-            mode only; None/empty -> PAE animation skipped).
-    """
-
-    mask = (best_batch['entity_id']==chain_to_number[binder_chain]).squeeze(0).detach().cpu().numpy()
-    sequence_history = [seq[mask] for seq in sequence_history]
-
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-
-
-    def create_distogram_animation():
-        plt.style.use('default')  # Use default white background style
-        fig, ax = plt.subplots(figsize=(6,6))
-        distogram_2d = distogram_history[0]
-        im = ax.imshow(distogram_2d)
-    
-        plt.colorbar(im, ax=ax)
-        ax.set_title('Distogram Evolution')
-
-        def update(frame):
-            distogram_2d = distogram_history[frame]
-            im.set_data(distogram_2d)
-            ax.set_title(f'Distogram Epoch {frame + 1}')
-            return im,
-
-        ani = FuncAnimation(fig, update, frames=len(distogram_history), interval=200)
-        if save_dir:
-            ani.save(os.path.join(save_dir, f'{save_filename}_distogram_evolution.gif'), writer='pillow')
-        plt.close()
-        return ani
-
-    # Create sequence evolution animation
-    def create_sequence_animation():
-        plt.style.use('default')  # Use default white background style
-        fig, ax = plt.subplots(figsize=(12,3.5))
-        im = ax.imshow(sequence_history[0].T, vmin=0, vmax=1, cmap='Blues', aspect='auto', alpha=0.8)
-        plt.colorbar(im, ax=ax)
-        ax.set_yticks(np.arange(20))
-        ax.set_yticklabels(list('ARNDCQEGHILKMFPSTWYV'))
-        ax.set_title('Sequence Evolution')
-
-        def update(frame):
-            im.set_data(sequence_history[frame].T)
-            ax.set_title(f'Sequence Epoch {frame + 1}')
-            return im,
-
-        ani = FuncAnimation(fig, update, frames=len(sequence_history), interval=200)
-        if save_dir:
-            ani.save(os.path.join(save_dir, f'{save_filename}_sequence_evolution.gif'), writer='pillow')
-        plt.close()
-        return ani
-
-    # Token-level chain boundaries (indices where entity_id changes), used to
-    # draw chain borders on the PAE map and separate binder/target on pLDDT,
-    # mirroring the AF3-server PAE plot.
-    entity_ids = best_batch['entity_id'].squeeze(0).detach().cpu().numpy()
-    chain_boundaries = [i for i in range(1, len(entity_ids))
-                        if entity_ids[i] != entity_ids[i - 1]]
-
-    # pLDDT evolution: line chart of per-token pLDDT vs token (residue) index.
-    def create_plddt_animation():
-        plt.style.use('default')
-        fig, ax = plt.subplots(figsize=(12, 3.5))
-        n = len(plddt_history[0])
-        x = np.arange(n)
-        (line,) = ax.plot(x, plddt_history[0], color='#1f77b4', linewidth=1.5)
-        ax.set_xlim(0, max(n - 1, 1))
-        ax.set_ylim(0, 1)
-        ax.set_xlabel('Token (residue) index')
-        ax.set_ylabel('pLDDT')
-        for b in chain_boundaries:
-            ax.axvline(b - 0.5, color='black', lw=1, linestyle='--', alpha=0.6)
-        ax.grid(True, linestyle='--', alpha=0.3)
-        ax.set_title('pLDDT Evolution')
-
-        def update(frame):
-            line.set_ydata(plddt_history[frame])
-            ax.set_title(f'pLDDT Epoch {frame + 1}')
-            return line,
-
-        ani = FuncAnimation(fig, update, frames=len(plddt_history), interval=200)
-        if save_dir:
-            ani.save(os.path.join(save_dir, f'{save_filename}_plddt_evolution.gif'), writer='pillow')
-        plt.close()
-        return ani
-
-    # PAE evolution: AF3-server-style heatmap (Greens_r, 0-30 A, chain borders).
-    # The full symmetric PAE already contains both the intra (PAE) and
-    # interface (iPAE) blocks, so a single map shows both.
-    def create_pae_animation():
-        plt.style.use('default')
-        fig, ax = plt.subplots(figsize=(6, 6))
-        im = ax.imshow(pae_history[0], cmap='Greens_r', vmin=0, vmax=30, origin='upper')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='PAE (Å)')
-        for b in chain_boundaries:
-            ax.axhline(b - 0.5, color='black', lw=1)
-            ax.axvline(b - 0.5, color='black', lw=1)
-        ax.set_xlabel('Aligned residue')
-        ax.set_ylabel('Aligned residue')
-        ax.set_title('Predicted Aligned Error (PAE)')
-
-        def update(frame):
-            im.set_data(pae_history[frame])
-            ax.set_title(f'PAE Epoch {frame + 1}')
-            return im,
-
-        ani = FuncAnimation(fig, update, frames=len(pae_history), interval=200)
-        if save_dir:
-            ani.save(os.path.join(save_dir, f'{save_filename}_pae_evolution.gif'), writer='pillow')
-        plt.close()
-        return ani
-
-    # Create and save animations
-    distogram_ani = create_distogram_animation()
-    sequence_ani = create_sequence_animation()
-    # pLDDT/PAE are full-mode-only -> skip cleanly if no frames were captured.
-    plddt_ani = create_plddt_animation() if plddt_history else None
-    pae_ani = create_pae_animation() if pae_history else None
-
-    return distogram_ani, sequence_ani, plddt_ani, pae_ani
-
-def get_mid_points(pdistogram):
-    boundaries = torch.linspace(2, 22.0, 63)
-    lower = torch.tensor([1.0])
-    upper = torch.tensor([22.0 + 5.0])
-    exp_boundaries = torch.cat((lower, boundaries, upper))
-    mid_points = ((exp_boundaries[:-1] + exp_boundaries[1:]) / 2).to(
-        pdistogram.device
-    )
-
-    return mid_points
-
-
-def get_CA_and_sequence(structure_file, chain_id='A'):
-    # Determine file type and use appropriate parser
-    if structure_file.endswith('.cif'):
-        parser = MMCIFParser(QUIET=True)
-    elif structure_file.endswith('.pdb'):
-        parser = PDBParser(QUIET=True)
-    else:
-        raise ValueError("File must be either .cif or .pdb format")
-        
-    structure = parser.get_structure("structure", structure_file)
-    xyz = []
-    sequence = []
-    aa_map = {
-        'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D',
-        'CYS': 'C', 'GLU': 'E', 'GLN': 'Q', 'GLY': 'G',
-        'HIS': 'H', 'ILE': 'I', 'LEU': 'L', 'LYS': 'K',
-        'MET': 'M', 'PHE': 'F', 'PRO': 'P', 'SER': 'S',
-        'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
-    }
-    
-    model = structure[0]  # Get first model (default for most structures)
-    
-    if chain_id in model:
-        chain = model[chain_id]
-        for residue in chain:
-            if "CA" in residue:
-                xyz.append(residue["CA"].coord)
-                sequence.append(aa_map.get(residue.resname, 'X'))
-    else:
-        raise ValueError(f"Chain {chain_id} not found in {structure_file}")
-    
-    return xyz, sequence
-
-
-# ---------------------------------------------------------------------------
-# Motif scaffolding (port of ColabDesign AFDesign `partial` protocol)
-#
-# ColabDesign's partial-hallucination supervised loss is `dgram_cce`
-# (af/loss.py::get_dgram_loss / _loss_partial): take the reference motif's
-# pseudo-Cβ coordinates, discretize the pairwise distance matrix into the
-# folding model's distogram bins, and apply categorical cross-entropy between
-# that one-hot target and the *predicted* distogram restricted to the motif
-# positions. Boltz1's distogram head uses 64 bins with edges
-# `torch.linspace(2, 22, 63)` and binning `(d > edges).sum(-1)` (see
-# boltz/.../confidence.py:81,295 and get_mid_points above), so the port is
-# exact. The whole loss lives on `pdistogram`, so it works in BoltzDesign1's
-# default fast mode (distogram_only=True) — no diffusion/coords needed, exactly
-# like the contact losses. This is what makes "design a binder that also
-# retains a catalytic/cofactor-binding motif" feasible in the cheap path.
-# ---------------------------------------------------------------------------
-
-_THREE_TO_ONE = {
-    'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
-    'GLU': 'E', 'GLN': 'Q', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
-    'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
-    'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V',
-}
-
-# res_type column for each one-letter AA, matching the alphabet used
-# throughout boltz_hallucination: list('XXARNDCQEGHILKMFPSTWYV-').
-_ALPHABET = list('XXARNDCQEGHILKMFPSTWYV-')
-_AA_TO_COL = {aa: i for i, aa in enumerate(_ALPHABET) if i >= 2 and aa not in ('X', '-')}
-
-
-def parse_residue_spec(spec):
-    """Parse a ColabDesign-style residue selection string.
-
-    Accepts plain author/PDB residue numbers, comma-separated, with optional
-    inclusive ranges, e.g. "10-14,57,102". Returns the ordered list of ints
-    (order preserved as written so motif placement is deterministic). Used by
-    ``--motif_binder_positions`` (one chain by construction -- the binder).
-    """
-    if spec is None:
-        return []
-    if isinstance(spec, (list, tuple)):
-        return [int(x) for x in spec]
-    residues = []
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok:
-            continue
-        if '-' in tok and not tok.startswith('-'):
-            lo, hi = tok.split('-')
-            residues.extend(range(int(lo), int(hi) + 1))
-        else:
-            residues.append(int(tok))
-    return residues
-
-
-def parse_motif_residue_spec(spec):
-    """Parse ``--motif_residues`` (chain-prefixed motif protein residue selection).
-
-    Every comma-separated token must carry a ``CHAIN`` prefix (leading letters)
-    followed by an author/PDB residue number or inclusive range, so a single
-    ``--motif_residues`` string can address motif residues across multiple
-    chains in the motif PDB (e.g. a catalytic triad spread over chains A and B).
-
-    Grammar (comma-separated, inclusive ranges with '-'):
-      ``"A57,A102,A195"``  -> all chain A
-      ``"B57,A102,C195"``  -> mixed chains
-      ``"A10-14,B57"``     -> ranges expanded inside each chain prefix
-
-    Returns a list of ``(chain_id, residue_number)`` tuples in declaration
-    order -- the same order ``--motif_binder_positions`` matches against
-    (1-to-1 with binder positions; ligand carry-along lives in the separate
-    ``--motif_ligand_residues`` flag).
-    """
-    if spec is None or spec == '':
-        return []
-    out = []
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok:
-            continue
-        i = 0
-        while i < len(tok) and tok[i].isalpha():
-            i += 1
-        if i == 0:
-            raise ValueError(
-                f"--motif_residues token '{tok}' must be CHAIN+RESNUM "
-                f"(e.g. 'A57' or 'A10-14'); bare residue numbers are not "
-                f"accepted -- prefix the chain explicitly.")
-        chain, body = tok[:i], tok[i:]
-        if not body:
-            raise ValueError(
-                f"--motif_residues token '{tok}' has a chain but no residue number")
-        if '-' in body and not body.startswith('-'):
-            lo, hi = body.split('-')
-            for r in range(int(lo), int(hi) + 1):
-                out.append((chain, r))
-        else:
-            out.append((chain, int(body)))
-    return out
-
-
-def extract_motif_coords(structure_file, chain_residues):
-    """Extract pseudo-Cβ coordinates + sequence for the requested motif.
-
-    Mirrors ColabDesign's pseudo_beta_fn: use CB when present, fall back to CA
-    (glycine / missing CB). ``chain_residues`` is a list of
-    ``(chain_id, author_resnum)`` tuples (the parsed ``--motif_residues``
-    output); entries are looked up per-chain and returned in declaration
-    order, so a single motif can span multiple chains in the motif PDB.
-    Raises a clear error if any requested residue is absent.
-    """
-    if structure_file.endswith('.cif'):
-        parser = MMCIFParser(QUIET=True)
-    elif structure_file.endswith('.pdb'):
-        parser = PDBParser(QUIET=True)
-    else:
-        raise ValueError("Motif structure must be .cif or .pdb")
-
-    model = parser.get_structure("motif", structure_file)[0]
-    # Cache per-chain residue maps so a mixed-chain spec doesn't re-scan.
-    chain_byres = {}
-    def _get(chain_id):
-        if chain_id in chain_byres:
-            return chain_byres[chain_id]
-        if chain_id not in model:
-            raise ValueError(
-                f"Motif chain {chain_id!r} not found in {structure_file}")
-        m = {res.id[1]: res for res in model[chain_id]
-             if res.id[0].strip() == ''}
-        chain_byres[chain_id] = m
-        return m
-
-    xyz, seq = [], []
-    for chain_id, rnum in chain_residues:
-        by_resseq = _get(chain_id)
-        if rnum not in by_resseq:
-            raise ValueError(
-                f"Motif residue {rnum} not found in chain {chain_id} of "
-                f"{structure_file} (available: "
-                f"{min(by_resseq)}-{max(by_resseq)})")
-        res = by_resseq[rnum]
-        atom = res['CB'] if 'CB' in res else (res['CA'] if 'CA' in res else None)
-        if atom is None:
-            raise ValueError(
-                f"Motif residue {chain_id}{rnum} ({res.resname}) has no CB or CA atom")
-        xyz.append(atom.coord)
-        seq.append(_THREE_TO_ONE.get(res.resname, 'X'))
-    return np.asarray(xyz, dtype=np.float32), ''.join(seq)
-
-
-def extract_motif_residue_atoms(structure_file, chain_residues):
-    """Per-residue heavy-atom coordinates for the motif: list of dicts
-    ``{'chain': str, 'resnum': int, 'resname': str,
-       'atoms': {atom_name: np.array([x,y,z])}}`` in declaration order.
-    Hydrogens are skipped.
-
-    Feeds both the backbone (N, CA, C, CB) Kabsch-RMSD target and the FAPE
-    sidechain target. ``chain_residues`` is a list of
-    ``(chain_id, author_resnum)`` tuples (the parsed ``--motif_residues``
-    output); per-chain lookups are cached so a mixed-chain spec doesn't
-    re-walk the structure.
-    """
-    if structure_file.endswith('.cif'):
-        parser = MMCIFParser(QUIET=True)
-    elif structure_file.endswith('.pdb'):
-        parser = PDBParser(QUIET=True)
-    else:
-        raise ValueError("Motif structure must be .cif or .pdb")
-
-    model = parser.get_structure("motif", structure_file)[0]
-    chain_byres = {}
-    def _get(chain_id):
-        if chain_id in chain_byres:
-            return chain_byres[chain_id]
-        if chain_id not in model:
-            raise ValueError(
-                f"Motif chain {chain_id!r} not found in {structure_file}")
-        m = {res.id[1]: res for res in model[chain_id]
-             if res.id[0].strip() == ''}
-        chain_byres[chain_id] = m
-        return m
-
-    out = []
-    for chain_id, rnum in chain_residues:
-        by_resseq = _get(chain_id)
-        if rnum not in by_resseq:
-            raise ValueError(
-                f"Motif residue {chain_id}{rnum} not found in chain "
-                f"{chain_id} of {structure_file}")
-        res = by_resseq[rnum]
-        atoms = {a.get_name(): np.asarray(a.coord, dtype=np.float32)
-                 for a in res if not a.get_name().startswith('H')}
-        if 'CA' not in atoms:
-            raise ValueError(
-                f"Motif residue {chain_id}{rnum} ({res.resname}) has no CA atom")
-        out.append({'chain': chain_id, 'resnum': rnum,
-                    'resname': res.resname, 'atoms': atoms})
-    return out
-
-
-def parse_motif_ligand_spec(spec):
-    """Parse the ``--motif_ligand_residues`` selection string.
-
-    Comma-separated chain-prefixed residue tokens, e.g. ``"B1"`` or
-    ``"B1,C401"``. Each token is one or more chain letters followed by the
-    author/PDB residue number in the motif PDB. Returns a list of
-    ``(chain_id, resnum)`` tuples in declaration order.
-
-    Unlike ``--motif_residues`` these entries do **not** consume slots in
-    ``--motif_binder_positions`` -- they are *carried along* by the rigid
-    transform Kabsch-fit on the protein motif backbone (decoupled alignment),
-    so the count is independent.
-    """
-    if spec is None or spec == '':
-        return []
-    out = []
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok:
-            continue
-        i = 0
-        while i < len(tok) and tok[i].isalpha():
-            i += 1
-        if i == 0:
-            raise ValueError(
-                f"--motif_ligand_residues token '{tok}' must be CHAIN+RESNUM "
-                f"(e.g. 'B1' = chain B, residue 1 in the motif PDB)")
-        chain = tok[:i]
-        body = tok[i:]
-        if not body or not body.lstrip('-').isdigit():
-            raise ValueError(
-                f"--motif_ligand_residues token '{tok}': residue number must "
-                f"be an integer")
-        out.append((chain, int(body)))
-    return out
-
-
-def extract_motif_ligand_atoms(structure_file, chain_residues):
-    """Per-entry heavy-atom coordinates for ligand residues in a motif PDB.
-
-    ``chain_residues``: list of ``(chain_id, author_resnum)`` tuples. Returns
-    a list of dicts ``{'chain', 'resnum', 'resname', 'atoms': {name: xyz}}``
-    in input order. Hydrogens skipped; HETATM allowed (no CA required, unlike
-    ``extract_motif_residue_atoms``). Used by the optional ligand carry-along
-    path of ``get_motif_coords_loss``.
-    """
-    if structure_file.endswith('.cif'):
-        parser = MMCIFParser(QUIET=True)
-    elif structure_file.endswith('.pdb'):
-        parser = PDBParser(QUIET=True)
-    else:
-        raise ValueError("Motif structure must be .cif or .pdb")
-    model = parser.get_structure("motif", structure_file)[0]
-    out = []
-    for chain_id, rnum in chain_residues:
-        if chain_id not in model:
-            raise ValueError(
-                f"--motif_ligand_residues: chain {chain_id!r} not in {structure_file}")
-        chain = model[chain_id]
-        # Match by author residue number; allow either standard or HETATM
-        # (ligands typically come in as HETATM with hetfield 'H_...').
-        match = next((r for r in chain if r.id[1] == rnum), None)
-        if match is None:
-            raise ValueError(
-                f"--motif_ligand_residues: residue {rnum} not in chain "
-                f"{chain_id} of {structure_file}")
-        atoms = {a.get_name(): np.asarray(a.coord, dtype=np.float32)
-                 for a in match if not a.get_name().startswith('H')}
-        if not atoms:
-            raise ValueError(
-                f"--motif_ligand_residues: residue {chain_id}{rnum} "
-                f"({match.resname}) has no heavy atoms")
-        out.append({'chain': chain_id, 'resnum': rnum,
-                    'resname': match.resname.strip(), 'atoms': atoms})
-    return out
-
-
-# ---- Sliding-window motif placements (--motif_unindex_residues) -------------
-# A motif whose **binder positions are not pre-specified**: only the per-residue
-# chain+resnum in the motif PDB and intra-island gap structure are fixed; the
-# absolute binder positions are sampled by MCMC + simulated annealing during
-# design (each epoch updates the placement state via Metropolis on the backbone
-# Kabsch RMSD). Coexists with --motif_residues: those occupy a fixed disjoint
-# set of binder positions; sliding islands are constrained to avoid them.
-def parse_motif_islands_spec(spec):
-    """Parse ``--motif_unindex_residues`` into a list of islands.
-
-    Grammar (comma-separated tokens):
-      * ``CHAIN+RESNUM`` (chain prefix + author/PDB residue number): a motif
-        residue.
-      * **bare integer**: spacer length *within the current island* (= number
-        of free binder positions between the two flanking residues). So
-        ``A38,3,A42`` means A38 at intra-offset 0 and A42 at intra-offset 4
-        (positions p+1, p+2, p+3 are free, A42 is at p+4).
-      * Two adjacent residue tokens (no integer between them) **start a new
-        island**: ``A38,3,A42,A170`` -> Island 1 [A38, A42], Island 2 [A170].
-        To put residues consecutively in *one* island, write the spacer
-        explicitly: ``A38,0,A39,0,A40``.
-
-    Returns a list of islands; each island is a list of dicts
-    ``{'chain': str, 'resnum': int, 'intra_offset': int}`` ordered so the
-    first residue has ``intra_offset == 0``. Intra-island order is preserved;
-    inter-island order/gaps are unspecified and will be sampled by the MCMC.
-    """
-    if spec is None or spec == '':
-        return []
-
-    def _parse_residue(tok):
-        i = 0
-        while i < len(tok) and tok[i].isalpha():
-            i += 1
-        if i == 0 or i == len(tok):
-            return None
-        chain, body = tok[:i], tok[i:]
-        try:
-            return chain, int(body)
-        except ValueError:
-            return None
-
-    def _is_spacer(tok):
-        if _parse_residue(tok) is not None:
-            return False
-        try:
-            int(tok)
-            return True
-        except ValueError:
-            return False
-
-    raw = [t.strip() for t in str(spec).split(',') if t.strip()]
-    islands = []
-    pending_spacer = None
-    for tok in raw:
-        if _is_spacer(tok):
-            if not islands:
-                raise ValueError(
-                    f"--motif_unindex_residues: leading spacer '{tok}' has no "
-                    f"preceding residue")
-            if pending_spacer is not None:
-                raise ValueError(
-                    f"--motif_unindex_residues: two consecutive spacers near '{tok}'")
-            spacer = int(tok)
-            if spacer < 0:
-                raise ValueError(
-                    f"--motif_unindex_residues: negative spacer '{tok}'")
-            pending_spacer = spacer
-            continue
-
-        res = _parse_residue(tok)
-        if res is None:
-            raise ValueError(
-                f"--motif_unindex_residues: token '{tok}' is neither "
-                f"CHAIN+RESNUM nor a non-negative integer spacer")
-        chain, resnum = res
-        if pending_spacer is not None:
-            last = islands[-1][-1]
-            new_offset = last['intra_offset'] + pending_spacer + 1
-            islands[-1].append({'chain': chain, 'resnum': resnum,
-                                'intra_offset': new_offset})
-            pending_spacer = None
-        else:
-            islands.append([{'chain': chain, 'resnum': resnum,
-                             'intra_offset': 0}])
-
-    if pending_spacer is not None:
-        raise ValueError("--motif_unindex_residues: trailing spacer with no residue")
-    # Sanity: no duplicate residues across islands.
-    seen = set()
-    for isl in islands:
-        for r in isl:
-            key = (r['chain'], r['resnum'])
-            if key in seen:
-                raise ValueError(
-                    f"--motif_unindex_residues: residue {r['chain']}{r['resnum']} "
-                    f"appears more than once")
-            seen.add(key)
-    return islands
-
-
-def island_length(island):
-    """Total span (max intra-offset + 1) of a parsed island."""
-    return max(r['intra_offset'] for r in island) + 1
-
-
-def _placement_to_positions(slide_state, islands):
-    """Expand per-island starts (slide_state[i]) into binder positions per
-    sliding motif residue, ordered by island-then-residue declaration order
-    (matches the reference-atom tensor layout)."""
-    positions = []
-    for i, island in enumerate(islands):
-        for r in island:
-            positions.append(slide_state[i] + r['intra_offset'])
-    return positions
-
-
-def is_placement_valid(slide_state, island_lengths, binder_length,
-                       fixed_positions):
-    """A placement is valid iff every island fits inside [0, binder_length),
-    no two sliding-motif positions collide, and none lands on
-    ``fixed_positions`` (the binder positions claimed by --motif_residues)."""
-    occupied = set(fixed_positions)
-    for o, L in zip(slide_state, island_lengths):
-        if o < 0 or o + L > binder_length:
-            return False
-        for p in range(o, o + L):
-            if p in occupied:
-                return False
-            occupied.add(p)
-    return True
-
-
-def random_valid_placement(island_lengths, binder_length, fixed_positions,
-                           rng, max_attempts=200):
-    """Greedy random init: random permutation of islands, then for each pick a
-    random valid starting position given already-placed islands and the
-    fixed-position exclusion set. Retries with fresh permutations on failure."""
-    n = len(island_lengths)
-    for _ in range(max_attempts):
-        perm = list(range(n))
-        rng.shuffle(perm)
-        positions = [None] * n
-        occupied = set(fixed_positions)
-        ok = True
-        for isl_idx in perm:
-            L = island_lengths[isl_idx]
-            valid_starts = [
-                s for s in range(binder_length - L + 1)
-                if all((s + k) not in occupied for k in range(L))
-            ]
-            if not valid_starts:
-                ok = False
-                break
-            s = rng.choice(valid_starts)
-            positions[isl_idx] = s
-            for k in range(L):
-                occupied.add(s + k)
-        if ok:
-            return positions
-    raise RuntimeError(
-        f"random_valid_placement: could not place all islands "
-        f"(lengths={island_lengths}) within binder of length {binder_length} "
-        f"excluding {len(fixed_positions)} fixed position(s)")
-
-
-def propose_mcmc_move(slide_state, island_lengths, binder_length,
-                      fixed_positions, shift_max, swap_prob, rng,
-                      max_attempts=50):
-    """Sample one MCMC proposal that is *valid* by construction.
-
-    With probability ``swap_prob`` (and only when 2+ islands exist), pick two
-    islands and swap their starting positions; otherwise shift one island's
-    start by a non-zero delta in [-shift_max, +shift_max]. Retry up to
-    ``max_attempts`` times for a valid proposal; return ``None`` if no valid
-    move was found (caller should treat as "stay")."""
-    n = len(slide_state)
-    if n == 0:
-        return None
-    for _ in range(max_attempts):
-        new_state = list(slide_state)
-        if n >= 2 and rng.random() < swap_prob:
-            i, j = rng.sample(range(n), 2)
-            new_state[i], new_state[j] = slide_state[j], slide_state[i]
-        else:
-            i = rng.randrange(n)
-            delta = rng.randint(-shift_max, shift_max)
-            if delta == 0:
-                continue
-            new_state[i] = slide_state[i] + delta
-        if is_placement_valid(new_state, island_lengths, binder_length,
-                              fixed_positions):
-            return new_state
-    return None
-
-
-def get_motif_target_distances(ref_xyz, device=None):
-    """Raw reference pairwise distances from motif coords (A), [M, M].
-
-    No bin discretization -- callers that need bin-aware loss (e.g.
-    ``get_motif_distogram_loss``) consume these together with the bin
-    midpoints to compute bin-center MSE.
-    """
-    x = torch.as_tensor(ref_xyz, dtype=torch.float32)
-    if device is not None:
-        x = x.to(device)
-    return torch.cdist(x, x)                              # [M, M]
-
-
-def get_motif_distogram_loss(pdistogram, motif_token_idx, target_dist, mid_pts):
-    """Bin-center MSE on the trunk distogram, restricted to motif token pairs.
-
-    For each motif pair (i, j), compute the expected squared error in bin-center
-    space against the reference pairwise distance:
-
-        L_ij = sum_k p_ijk * (mid_pts_k - target_dist[i, j])^2          [A^2]
-
-    averaged over distinct motif pairs (i != j).
-
-    MSE-style: decomposes as Var(d_k | i,j) + (E[d_k | i,j] - target_dist_ij)^2,
-    so it drives both the expected distance to the reference AND the prediction
-    toward a sharp delta there. Bin-center-aware: putting mass on a near-but-
-    wrong bin is cheap, on a far-wrong bin is expensive (penalty grows with
-    squared bin-center distance from reference). Replaces the previous one-hot
-    categorical CE form, which was bin-membership-only (every wrong bin
-    contributed -log P regardless of how far it was from the right bin) and
-    was sensitive to which bin straddle the reference distance fell into.
-
-    ``pdistogram`` is the raw predicted logits [1, N, N, num_bins]; we gather
-    the sub-block at the motif token indices so this works with the trunk-only
-    fast path (distogram_only=True).
-    """
-    p = pdistogram[0].index_select(0, motif_token_idx).index_select(1, motif_token_idx)
-    prob = torch.softmax(p, dim=-1)                            # [M, M, num_bins]
-    err2 = (mid_pts.view(1, 1, -1) - target_dist.unsqueeze(-1)) ** 2  # [M, M, num_bins]
-    per_pair = (prob * err2).sum(dim=-1)                       # [M, M], A^2
-    M = motif_token_idx.shape[0]
-    mask = ~torch.eye(M, dtype=torch.bool, device=per_pair.device)
-    return per_pair[mask].mean()
-
-
-def np_kabsch(a, b, return_v=False):
-    '''Get alignment matrix for two sets of coordinates using numpy
-    
-    Args:
-        a: First set of coordinates
-        b: Second set of coordinates
-        return_v: If True, return U matrix from SVD. If False, return rotation matrix
-        
-    Returns:
-        Rotation matrix (or U matrix if return_v=True) to align coordinates
-    '''
-    # Calculate covariance matrix
-    ab = np.swapaxes(a, -1, -2) @ b
-    
-    # Singular value decomposition
-    u, s, vh = np.linalg.svd(ab, full_matrices=False)
-    
-    # Handle reflection case
-    flip = np.linalg.det(u @ vh) < 0
-    if flip:
-        u[...,-1] = -u[...,-1]
-    
-    return u if return_v else (u @ vh)
-
-
-def align_points(a, b):
-    a_centroid = a.mean(axis=0)
-    b_centroid = b.mean(axis=0)
-
-    a_centered = a - a_centroid
-    b_centered = b - b_centroid
-
-    R = np_kabsch(a_centered, b_centered)
-    a_aligned = a_centered @ R + b_centroid
-    return a_aligned
-
-
-def np_rmsd(true, pred):
-    '''Compute RMSD of coordinates after alignment using numpy
-    
-    Args:
-        true: Reference coordinates
-        pred: Predicted coordinates to align
-        
-    Returns:
-        Root mean square deviation after optimal alignment
-    '''
-    # Center coordinates
-    p = true - np.mean(true, axis=-2, keepdims=True)
-    q = pred - np.mean(pred, axis=-2, keepdims=True)
-    
-    # Get optimal rotation matrix and apply it
-    p = p @ np_kabsch(p, q)
-    
-    # Calculate RMSD
-    return np.sqrt(np.mean(np.sum(np.square(p-q), axis=-1)) + 1e-8)
-
-    
-def min_k(x, k=1, mask=None):
-    # Convert mask to boolean if it's not None
-    if mask is not None:
-        mask = mask.bool()  # Convert to boolean tensor
-    
-    # Sort the tensor, replacing masked values with Nan
-    y = torch.sort(x if mask is None else torch.where(mask, x, float('nan')))[0]
-
-    # Create a mask for the top k value
-    k_mask = (torch.arange(y.shape[-1]).to(y.device) < k) & (~torch.isnan(y))
-    # Compute the mean of the top k values
-    return torch.where(k_mask, y, 0).sum(-1) / (k_mask.sum(-1) + 1e-8)
-
-
-def get_con_loss(dgram, dgram_bins, num=None, seqsep=None, num_pos = float("inf"), cutoff=None, binary=False, mask_1d=None, mask_1b=None):
-    con_loss = _get_con_loss(dgram, dgram_bins, cutoff, binary)
-    idx = torch.arange(dgram.shape[1])
-    offset = idx[:,None] - idx[None,:]
-    # Add mask for position separation > 3
-    m =(torch.abs(offset)>=seqsep).to(dgram.device)
-    if mask_1d is None: mask_1d = torch.ones(m.shape[0])
-    if mask_1b is None: mask_1b = torch.ones(m.shape[0])
-
-    m = torch.logical_and(m, mask_1b)
-    p = min_k(con_loss, num, m).to(dgram.device)
-    p = min_k(p, num_pos, mask_1d).to(dgram.device)
-    return p
-
-
-def _get_con_loss(dgram, dgram_bins, cutoff=None, binary=False):
-    '''dgram to contacts'''
-    if cutoff is None: cutoff = dgram_bins[-1]
-    bins = dgram_bins < cutoff  
-    px = torch.softmax(dgram, dim=-1)
-    px_ = torch.softmax(dgram - 1e7 * (~ bins), dim=-1)        
-    # binary/categorical cross-entropy
-    con_loss_cat_ent = -(px_ * torch.log_softmax(dgram, dim=-1)).sum(-1)
-    con_loss_bin_ent = -torch.log((bins * px + 1e-8).sum(-1))
-
-    return binary * con_loss_bin_ent + (1 - binary) * con_loss_cat_ent
-
-
-def mask_loss(x, mask=None, mask_grad=False):
-    if mask is None:
-        return x.mean()
-    else:
-        x_masked = (x * mask).sum() / (1e-8 + mask.sum())
-        if mask_grad:
-            return (x.mean() - x_masked).detach() + x_masked
-        else:
-            return x_masked
-
-
-def get_plddt_loss(plddt, mask_1d=None):
-    p = 1 - plddt
-    return mask_loss(p, mask_1d)
-
-
-def get_pae_loss(pae, mask_1d=None, mask_1b=None, mask_2d=None):
-  pae = pae/31.0
-  L = pae.shape[1]
-  if mask_1d is None: mask_1d = torch.ones(L).to(pae.device)
-  if mask_1b is None: mask_1b = torch.ones(L).to(pae.device)
-  if mask_2d is None: mask_2d = torch.ones((L, L)).to(pae.device)
-  mask_2d = mask_2d * mask_1d[:, :, None] * mask_1b[:, None, :]
-  return mask_loss(pae, mask_2d)
-
-
-def _get_helix_loss(dgram, dgram_bins, offset=None, mask_2d=None, binary=False, **kwargs):
-    '''helix bias loss'''
-    x = _get_con_loss(dgram, dgram_bins, cutoff=6.0, binary=binary)
-    if offset is None:
-        if mask_2d is None:
-            return x.diagonal(offset=3).mean()
-        else:
-            mask_2d = mask_2d.float() 
-            return (x * mask_2d).diagonal(offset=3, dim1=-2, dim2=-1).sum() / (torch.diagonal(mask_2d, offset=3, dim1=-2, dim2=-1).sum() + 1e-8)
-
-    else:
-        mask = (offset == 3).float()
-        if mask_2d is not None:
-            mask = mask * mask_2d.float()
-        return (x * mask).sum() / (mask.sum() + 1e-8)
-
-
-def get_ca_coords(sample_atom_coords, batch, binder_chain='A'):
-    atom_to_token = batch['atom_to_token'] * (batch['entity_id']==chain_to_number[binder_chain])
-    atom_order = torch.cumsum(atom_to_token, dim=1)
-    ca_mask = torch.sum((atom_order == 2).to(atom_to_token.dtype), dim=-1)[0]
-    ca_coords = sample_atom_coords[:,ca_mask==1,:]
-    return ca_coords
-
-
-def add_rg_loss(sample_atom_coords, batch, length, binder_chain='A'):
-    ca_coords = get_ca_coords(sample_atom_coords, batch, binder_chain)
-    center_of_mass = ca_coords.mean(1, keepdim=True)  # keepdim for proper broadcasting
-    squared_distances = torch.sum(torch.square(ca_coords - center_of_mass), dim=-1)
-    rg = torch.sqrt(squared_distances.mean() + 1e-8)
-    rg_th = 2.38 * ca_coords.shape[1] ** 0.365
-    loss = torch.nn.functional.elu(rg - rg_th)
-    return loss, rg
-
-
-def parse_pdb_ori_atoms(pdb_path):
-    """Return (N,3) numpy array of HETATM ORI xyz coords found in a PDB file.
-
-    Matches by atom name == 'ORI' in the standard PDB column layout. The user
-    inserts these into their --pdb_path / --motif_pdb manually (custom HETATM
-    records, e.g. ``HETATM ... ORI  ORI z   1   x  y  z``) to anchor a desired
-    binder centroid. Returns an empty array if the file is missing or contains
-    no ORI atoms (caller treats this as "no source from this PDB").
-    """
-    if not pdb_path or not os.path.exists(pdb_path):
-        return np.zeros((0, 3), dtype=np.float32)
-    out = []
-    with open(pdb_path) as f:
-        for line in f:
-            if not line.startswith('HETATM'):
-                continue
-            # PDB column layout: 13-16 atom name, 31-38 x, 39-46 y, 47-54 z.
-            if line[12:16].strip() == 'ORI':
-                try:
-                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
-                except ValueError:
-                    continue
-                out.append([x, y, z])
-    return np.asarray(out, dtype=np.float32) if out else np.zeros((0, 3), dtype=np.float32)
-
-
-def _kabsch_transform(src, dst):
-    """Shared Kabsch SVD core: returns ``(R, src_mean, dst_mean)`` such that
-    ``aligned = (src - src_mean) @ R.T + dst_mean`` is the least-squares fit
-    of src onto dst (proper rotation, no chirality flip via the det term).
-
-    Used by both ``kabsch_align`` and ``add_com_loss`` (detached).
-    """
-    src_mean = src.mean(dim=0, keepdim=True)
-    dst_mean = dst.mean(dim=0, keepdim=True)
-    H = (src - src_mean).transpose(-1, -2) @ (dst - dst_mean)
-    U, S, Vh = torch.linalg.svd(H, full_matrices=False)
-    d = torch.sign(torch.det(Vh.transpose(-1, -2) @ U.transpose(-1, -2)))
-    D = torch.diag(torch.stack([torch.ones_like(d), torch.ones_like(d), d]))
-    R = Vh.transpose(-1, -2) @ D @ U.transpose(-1, -2)
-    return R, src_mean.squeeze(0), dst_mean.squeeze(0)
-
-
-def add_com_loss(sample_atom_coords, batch, com_sources, binder_chain='A'):
-    """COM loss: binder centroid pulled toward the mean of user-specified ORI
-    HETATM atoms (parsed once from --pdb_path / --motif_pdb), each transformed
-    from its input PDB frame into the current co-fold frame by a per-source
-    Kabsch fit on that source's anchor atoms.
-
-    The fit is computed under ``torch.no_grad()`` and the transformed ORI is
-    detached: the gradient flows ONLY through ``binder_com`` (i.e. through the
-    binder's predicted CA positions). This is both physically right -- we want
-    the binder to MOVE toward where the ORI is in the current target frame,
-    not to "nudge the target's prediction so the ORI moves toward the binder"
-    -- and numerically right (SVD backward is unstable near degenerate
-    singular values; same instability that ``--deterministic_sampler`` avoids
-    in the diffusion sampler). Mirrors ``kabsch_align``'s SVD core via the
-    shared ``_kabsch_transform`` helper.
-
-    com_sources : list of dicts, each
-        {
-          'anchor_idx': LongTensor [M]  -- atom indices into sample_atom_coords
-                                          for this source's anchor atoms in
-                                          the co-fold (predicted) frame.
-          'anchor_ref': FloatTensor [M,3]  -- input-frame anchor xyz (constant).
-          'ori_ref':    FloatTensor [K,3]  -- input-frame ORI xyz from this PDB.
-          'label':      str (for diagnostics).
-        }
-    Per source: fit (anchor_ref -> anchor_pred), apply to ori_ref to get
-    predicted ORI xyz in the co-fold frame; concatenate across sources and
-    average. Loss = ||binder_COM - mean_ORI||_2 in Angstrom.
-
-    Returns (loss, binder_com, mean_ori, transformed_oris_concat) -- the extra
-    return values let the caller log the achieved distance for diagnostics.
-    """
-    coords = sample_atom_coords[0]                                       # [N, 3]
-    transformed = []
-    with torch.no_grad():
-        for src in com_sources:
-            anchor_pred = coords[src['anchor_idx'], :].detach()          # [M, 3]
-            R, s_mean, d_mean = _kabsch_transform(src['anchor_ref'], anchor_pred)
-            ori_pred = (src['ori_ref'] - s_mean) @ R.transpose(-1, -2) + d_mean  # [K, 3]
-            transformed.append(ori_pred)
-    all_oris = torch.cat(transformed, dim=0).detach()                    # [sum K, 3]
-    mean_ori = all_oris.mean(0)                                          # [3], constant
-    ca = get_ca_coords(sample_atom_coords, batch, binder_chain)[0]       # [N_binder, 3]
-    binder_com = ca.mean(0)                                              # [3], differentiable
-    loss = torch.norm(binder_com - mean_ori, p=2)
-    return loss, binder_com, mean_ori, all_oris
-
-
-def kabsch_align(pred, ref):
-    """Kabsch alignment of pred onto ref (least-squares, proper rotation).
-
-    SVD is run under ``torch.no_grad()`` so R/p_mean/r_mean are treated as
-    constants; the linear apply ``(pred - p_mean) @ R.T + r_mean`` is in-graph,
-    so ``pred``'s gradient still flows through the affine transform. By the
-    envelope theorem this gives the same gradient w.r.t. ``pred`` as a fully
-    in-graph SVD would, without the SVD-backward instability (pathological
-    near degenerate singular values, same risk that ``--deterministic_sampler``
-    works around in the diffusion sampler).
-    """
-    with torch.no_grad():
-        R, p_mean, r_mean = _kabsch_transform(pred, ref)
-    return (pred - p_mean) @ R.transpose(-1, -2) + r_mean
-
-
-def get_motif_coords_loss(sample_atom_coords, bb_pred_idx, bb_ref_xyz,
-                          lig_pred_idx=None, lig_ref_xyz=None,
-                          return_stats=False):
-    """Decoupled-alignment motif RMSD in Å.
-
-    Kabsch alignment is fit from the **protein motif backbone** (N, CA, C, CB)
-    alone — typically ~4·M atoms, a well-defined rigid frame. The same rigid
-    transform is then applied to predicted **ligand atoms** (if provided), and
-    a combined RMSD over backbone + ligand is returned. The decoupled scheme
-    is deliberate for enzyme/cofactor scaffolding (e.g. hemoprotein): if a
-    ~40-atom heme were folded into the Kabsch fit it would dominate the
-    alignment and absorb its own placement error, defeating the point of the
-    loss. Holding the transform to the backbone instead makes the ligand RMSD
-    report ligand placement *relative to the motif framework*.
-
-    Backward-compat: pass ``lig_pred_idx=lig_ref_xyz=None`` for the
-    backbone-only path (byte-identical to the previous loss). Carries a
-    gradient through ``sample_atom_coords`` only with ``--attach_coords True``
-    (mirrors rg_loss); otherwise inert but still reported.
-
-    sample_atom_coords: [1, n_atoms, 3] from the diffusion sampler.
-    bb_pred_idx:        [K] global atom indices (motif backbone N,CA,C,CB).
-    bb_ref_xyz:         [K, 3] reference backbone coords (Å), same order.
-    lig_pred_idx:       [L] global atom indices (motif ligand heavy atoms).
-    lig_ref_xyz:        [L, 3] reference ligand coords (Å), same order.
-    return_stats:       if True, also return a dict with per-component RMSDs
-                        (``bb_rmsd``, ``lig_rmsd``) for diagnostics.
-    """
-    pred_bb = sample_atom_coords[0].index_select(0, bb_pred_idx)           # [K,3]
-    p_mean = pred_bb.mean(dim=0, keepdim=True)
-    r_mean = bb_ref_xyz.mean(dim=0, keepdim=True)
-    pc = pred_bb - p_mean
-    rc = bb_ref_xyz - r_mean
-    H = pc.transpose(-1, -2) @ rc                                          # [3,3]
-    U, _S, Vh = torch.linalg.svd(H, full_matrices=False)
-    d = torch.sign(torch.det(Vh.transpose(-1, -2) @ U.transpose(-1, -2)))
-    D = torch.diag(torch.stack([torch.ones_like(d), torch.ones_like(d), d]))
-    R = Vh.transpose(-1, -2) @ D @ U.transpose(-1, -2)                     # [3,3]
-    pred_bb_al = pc @ R.transpose(-1, -2) + r_mean                         # [K,3]
-    bb_err2 = ((pred_bb_al - bb_ref_xyz) ** 2).sum(dim=-1)                 # [K]
-
-    if lig_pred_idx is None or lig_ref_xyz is None:
-        loss = torch.sqrt(bb_err2.mean() + 1e-8)
-        if return_stats:
-            return loss, {'bb_rmsd': loss.detach().item(), 'lig_rmsd': None}
-        return loss
-
-    pred_lig = sample_atom_coords[0].index_select(0, lig_pred_idx)         # [L,3]
-    pred_lig_al = (pred_lig - p_mean) @ R.transpose(-1, -2) + r_mean       # [L,3]
-    lig_err2 = ((pred_lig_al - lig_ref_xyz) ** 2).sum(dim=-1)              # [L]
-    all_err2 = torch.cat([bb_err2, lig_err2], dim=0)
-    loss = torch.sqrt(all_err2.mean() + 1e-8)
-    if return_stats:
-        return loss, {
-            'bb_rmsd': torch.sqrt(bb_err2.mean() + 1e-8).detach().item(),
-            'lig_rmsd': torch.sqrt(lig_err2.mean() + 1e-8).detach().item(),
-        }
-    return loss
-
-
-def _rigid_frames(n_xyz, ca_xyz, c_xyz, eps=1e-8):
-    """AlphaFold-style rigid frames (Alg. 21) from backbone N, CA, C.
-
-    Returns R [F, 3, 3] with columns (e1, e2, e3) and origin t = CA [F, 3]; the
-    local coordinate of a point x in frame f is R_f^T (x - t_f).
-    """
-    v1 = c_xyz - ca_xyz
-    v2 = n_xyz - ca_xyz
-    e1 = v1 / (v1.norm(dim=-1, keepdim=True) + eps)
-    u2 = v2 - e1 * (e1 * v2).sum(dim=-1, keepdim=True)
-    e2 = u2 / (u2.norm(dim=-1, keepdim=True) + eps)
-    e3 = torch.cross(e1, e2, dim=-1)
-    R = torch.stack([e1, e2, e3], dim=-1)                                 # [F,3,3]
-    return R, ca_xyz
-
-
-def get_motif_fape_loss(sample_atom_coords, frame_pred_idx, sc_pred_idx, loc_ref,
-                        clamp=10.0):
-    """Frame-based (FAPE-style) sidechain error for the motif, in Å.
-
-    A backbone frame (N, CA, C) is built for each motif residue; every motif
-    sidechain heavy atom is expressed in *every* motif frame and compared, in
-    local-frame coordinates, to the reference (`loc_ref`, precomputed once since
-    the reference is constant). This is the AlphaFold FAPE restricted to motif
-    residues: invariant to the global pose, sensitive to relative sidechain
-    placement (e.g. catalytic-triad geometry), clamped at `clamp` Å, averaged
-    over (frame, atom) pairs.
-
-    Note: during the design loop the binder is built as UNK, so the only shared
-    sidechain heavy atoms are typically CB and CG; full rotamers are not present
-    unless the binder is built with the reference residue types. Gradient through
-    coords only with `--attach_coords True`.
-
-    frame_pred_idx: [F, 3] global atom indices (N, CA, C) per motif frame.
-    sc_pred_idx:    [S]    global atom indices of motif sidechain atoms.
-    loc_ref:        [F, S, 3] reference local-frame coords (constant).
-    """
-    coords = sample_atom_coords[0]
-    R, t = _rigid_frames(coords[frame_pred_idx[:, 0]],
-                         coords[frame_pred_idx[:, 1]],
-                         coords[frame_pred_idx[:, 2]])                     # [F,3,3],[F,3]
-    x = coords.index_select(0, sc_pred_idx)                               # [S,3]
-    diff = x[None, :, :] - t[:, None, :]                                  # [F,S,3]
-    loc_pred = torch.einsum('fij,fsj->fsi', R.transpose(-1, -2), diff)    # [F,S,3]
-    d = torch.sqrt(((loc_pred - loc_ref) ** 2).sum(dim=-1) + 1e-8)        # [F,S]
-    return torch.clamp(d, max=clamp).mean()
-
-
-# ---- Explicit atom/residue distance restraints (--atom_pairs) ---------------
-# A loss term, independent of the general binder-target contact loss, that
-# pushes the distance between two *specified* points toward a window [lo,hi].
-# The pair may span ANY two chains -- including target<->target (e.g. holding a
-# cofactor near a particular target-protein residue). Two flavors, wired like
-# the motif losses:
-#   * distogram (token-level, fast-mode safe): -log P(dist in [lo,hi]) from the
-#     trunk distogram. Ligand atoms address an exact token; polymer residues
-#     resolve to their Cb token.
-#   * coords (atom-level, full mode): flat-bottom restraint on sample_atom_coords
-#     for any named atom on either side. Gradient requires --attach_coords True.
-def _decode_atom_name(name_arr):
-    """Decode a boltz Atom['name'] (4x int8, char == value + 32) to a string."""
-    return ''.join(chr(int(x) + 32) for x in name_arr if int(x) != 0).strip()
-
-
-def _parse_endpoint(ep):
-    """'C:FE' | 'B:145' | 'B:145@NE2' -> (chain, selector, atom_override)."""
-    if ':' not in ep:
-        raise ValueError(f"atom-pair endpoint '{ep}' must be 'CHAIN:SELECTOR'")
-    chain, sel = ep.split(':', 1)
-    atom_override = None
-    if '@' in sel:
-        sel, atom_override = sel.split('@', 1)
-        atom_override = atom_override.strip()
-    return chain.strip(), sel.strip(), atom_override
-
-
-def parse_atom_pairs_spec(spec):
-    """Parse the --atom_pairs string into raw endpoint dicts (no batch needed).
-
-    Grammar (per ';'-separated chunk):
-       4 fields -- "<epA>, <epB>, <lo>, <hi>"   window restraint
-       3 fields -- "<epA>, <epB>, <d_ref>"      point-target restraint (lo=hi=d_ref)
-
-    Each endpoint is CHAIN:SEL[@ATOM]; SEL is a 1-indexed residue position for
-    polymer chains or an atom name for ligand chains, and @ATOM optionally pins
-    a named atom (used by the coord loss; the distogram loss is token/Cb-level).
-    Distances are in Angstrom.
-
-    The point-target form is what the 'expected' distogram method turns into the
-    literal SwitchCraft motif loss sum_k p_k (d_k - d_ref)^2 (which decomposes
-    as variance + bias^2 about d_ref, so it both pulls the expected distance to
-    d_ref AND drives the prediction toward a sharp delta there); the window
-    form stays a flat-bottom on the expected distance E[d].
-    """
-    pairs = []
-    for chunk in spec.split(';'):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        fields = [f.strip() for f in chunk.split(',')]
-        if len(fields) == 4:
-            epA, epB, lo, hi = fields
-            lo, hi = float(lo), float(hi)
-            if hi < lo:
-                raise ValueError(f"atom-pair '{chunk}': hi ({hi}) < lo ({lo})")
-        elif len(fields) == 3:
-            epA, epB, d_ref = fields
-            lo = hi = float(d_ref)
-        else:
-            raise ValueError(
-                f"atom-pair '{chunk}' must have 3 fields 'epA, epB, d_ref' "
-                f"(point target) or 4 fields 'epA, epB, lo, hi' (window)")
-        cA, sA, aA = _parse_endpoint(epA)
-        cB, sB, aB = _parse_endpoint(epB)
-        pairs.append({'chainA': cA, 'selA': sA, 'atomA': aA,
-                      'chainB': cB, 'selB': sB, 'atomB': aB,
-                      'lo': lo, 'hi': hi})
-    if not pairs:
-        raise ValueError("--atom_pairs is set but no valid pairs were parsed")
-    return pairs
-
-
-def _find_named_atom(structure, a0, anum, name, chain, sel):
-    for i in range(anum):
-        if _decode_atom_name(structure.atoms['name'][a0 + i]) == name:
-            return a0 + i
-    where = f"chain {chain}" + (f" residue {sel}" if sel else "")
-    raise ValueError(f"atom '{name}' not found in {where}")
-
-
-def _resolve_endpoint_indices(chain, sel, atom_override, entity_id, structure):
-    """Map one endpoint to (token_idx, atom_idx, label_name).
-
-    token_idx indexes the distogram axis; atom_idx indexes sample_atom_coords
-    (== global structure.atoms order). Polymer SEL = 1-indexed residue position
-    (token = that residue; distogram atom = Cb via atom_disto; atom_override
-    picks a specific atom for the coord loss). Ligand SEL = atom name (token ==
-    that atom; ligands are tokenized one-token-per-atom, in order).
-    """
-    if chain not in chain_to_number:
-        raise ValueError(f"unknown chain '{chain}' in atom-pair spec")
-    chain_tokens = torch.where(entity_id == chain_to_number[chain])[0]
-    if chain_tokens.numel() == 0:
-        raise ValueError(f"chain '{chain}' has no tokens in the batch")
-    crec = next((c for c in structure.chains if c['name'] == chain), None)
-    if crec is None:
-        raise ValueError(f"chain '{chain}' not found in structure")
-    a0, anum = int(crec['atom_idx']), int(crec['atom_num'])
-
-    if sel.isdigit():                                    # polymer residue
-        pos = int(sel) - 1
-        if not (0 <= pos < chain_tokens.numel()):
-            raise ValueError(
-                f"chain {chain} residue position {sel} out of range "
-                f"(1..{chain_tokens.numel()})")
-        tok = int(chain_tokens[pos])
-        res = structure.residues[int(crec['res_idx']) + pos]
-        if atom_override:
-            atom_idx = _find_named_atom(structure, int(res['atom_idx']),
-                                        int(res['atom_num']), atom_override, chain, sel)
-        else:
-            atom_idx = int(res['atom_disto'])            # Cb (matches distogram)
-        return tok, atom_idx, str(res['name'])
-    # ligand atom name -> its token (one token per atom, in atom order)
-    atom_idx = _find_named_atom(structure, a0, anum, sel, chain, None)
-    local = atom_idx - a0
-    if not (0 <= local < chain_tokens.numel()):
-        raise ValueError(f"atom {sel} in chain {chain} maps outside token range")
-    return int(chain_tokens[local]), atom_idx, sel
-
-
-def resolve_atom_pairs(spec, batch, structure):
-    """Parse + resolve --atom_pairs against a built batch/structure.
-
-    Returns dicts with integer indices ready for the loss: tok_a/tok_b on the
-    distogram token axis, atom_a/atom_b on the sample_atom_coords atom axis,
-    plus lo/hi (A) and a human-readable label. Resolved once per run -- the
-    binder length is fixed, so the target token/atom indices are stable.
-    """
-    entity_id = batch['entity_id']
-    if entity_id.dim() > 1:
-        entity_id = entity_id[0]
-    resolved = []
-    for p in parse_atom_pairs_spec(spec):
-        ta, aa, na = _resolve_endpoint_indices(p['chainA'], p['selA'], p['atomA'],
-                                               entity_id, structure)
-        tb, ab, nb = _resolve_endpoint_indices(p['chainB'], p['selB'], p['atomB'],
-                                               entity_id, structure)
-        labA = f"{p['chainA']}:{p['selA']}{('@'+p['atomA']) if p['atomA'] else ''}({na})"
-        labB = f"{p['chainB']}:{p['selB']}{('@'+p['atomB']) if p['atomB'] else ''}({nb})"
-        resolved.append({'tok_a': ta, 'tok_b': tb, 'atom_a': aa, 'atom_b': ab,
-                         'lo': p['lo'], 'hi': p['hi'],
-                         'label': f"{labA} - {labB} [{p['lo']},{p['hi']}]A"})
-    return resolved
-
-
-def get_atom_pair_distogram_loss(pdistogram, pair_specs, mid_pts,
-                                 method='expected', return_stats=False):
-    """Distogram-based distance restraint over the --atom_pairs token pairs.
-    Three selectable formulations (`method=`):
-
-      'expected' (default) -- bin-center MSE on the predicted distribution:
-                    POINT TARGET (lo == hi == d_ref, set by the 3-field spec
-                    "epA, epB, d_ref"):  sum_k p_k * (mid_pts_k - d_ref)^2
-                       -- the literal SwitchCraft motif loss (Eq 1). Equals
-                       Var(d_k) + (E[d_k] - d_ref)^2, so it pulls the expected
-                       distance to d_ref AND drives the prediction toward a sharp
-                       delta at d_ref. Always > 0 unless the prediction is a
-                       perfect delta at d_ref.
-                    WINDOW (lo < hi, 4-field spec "epA, epB, lo, hi"):
-                       relu(lo - E[d])^2 + relu(E[d] - hi)^2 on the expected
-                       distance E[d] = sum(prob * mid_pts). Flat-bottom: zero
-                       once E[d] in [lo, hi]; only the mean is penalized
-                       (variance is invisible). Force grows with distance inside
-                       the resolved range, but the gradient saturates at the
-                       far end (see ceiling note).
-      'prob'     -- -log P(d in [lo,hi]): the in-window probability MASS read
-                    from the symmetrized token-pair distribution. Can be driven
-                    down by parking a little mass in-window while the bulk of
-                    the distribution -- and hence the sampled structure -- stays
-                    far away; its gradient also collapses by ~20 A (the eps clamp
-                    + softmax saturation), so it stops pulling exactly when you
-                    need it to.
-      'contact'  -- the same objective BoltzDesign1 uses to FORM binder-target
-                    contacts: ColabDesign's categorical contact cross-entropy
-                    (_get_con_loss, binary=False) with the contact cutoff = hi.
-                    A -log-type loss whose gradient is large when the pair is far
-                    and tapers as probability moves within hi (i.e. large far,
-                    small near -- a robust monotonic "pull them together" force).
-                    One-sided: lo is ignored. Use when the pair starts far apart
-                    and you want it driven into contact.
-
-    Averaged over pairs. Fast-mode safe. Token resolution: ligand atoms exact,
-    polymer residues at Cb.
-
-    CEILING (applies to ALL three methods): the distogram spans ~2-22 A with one
-    catch-all last bin (center ~24.5 A), so it cannot distinguish e.g. 30 A from
-    100 A. Once the trunk is confident the pair is past ~24 A the softmax is a
-    near-delta on that bin and the gradient of any distogram loss vanishes there.
-    To pull a pair that is *genuinely* far with a force that keeps growing with
-    distance, use the COORD restraint (get_atom_pair_coords_loss) in full mode
-    (--distogram_only False --attach_coords True): ||x_a - x_b|| is unbounded.
-
-    return_stats=True also returns per-pair diagnostics (detached): exp_dist,
-    mode_dist, p_window and the per-pair loss -- so callers can log the exact
-    distance regardless of which method drives the gradient."""
-    p = pdistogram[0]                                     # [L, L, 64]
-    terms, stats = [], []
-    for s in pair_specs:
-        logits = (p[s['tok_a'], s['tok_b']] + p[s['tok_b'], s['tok_a']]) / 2  # symmetric
-        prob = torch.softmax(logits, dim=-1)
-        exp_d = (prob * mid_pts).sum()                    # expected distance (A)
-        win = ((mid_pts >= s['lo']) & (mid_pts <= s['hi'])).to(prob.dtype)
-        p_window = (prob * win).sum()
-        if method == 'expected':
-            if s['lo'] == s['hi']:                        # point target -> SwitchCraft Eq 1
-                # sum_k p_k * (mid_pts_k - d_ref)^2 = Var(d_k) + (E[d_k] - d_ref)^2
-                # (penalizes both prediction spread AND mean-distance bias).
-                d_ref = s['lo']
-                term = (prob * (mid_pts - d_ref).pow(2)).sum()
-            else:                                         # window -> flat-bottom on E[d]
-                term = torch.relu(s['lo'] - exp_d) ** 2 + torch.relu(exp_d - s['hi']) ** 2
-        elif method == 'prob':
-            term = -torch.log(p_window + 1e-8)
-        elif method == 'contact':
-            # Reuse BoltzDesign1's proven contact loss (ColabDesign categorical
-            # cross-entropy) on this single token pair, contact cutoff = hi. Gives
-            # a robust attractive gradient that is large when the pair is far and
-            # tapers as it approaches the window (lo ignored). Same numerically
-            # stable log_softmax path used for binder-target contacts; still
-            # subject to the distogram ceiling (see docstring).
-            term = _get_con_loss(logits, mid_pts, cutoff=s['hi'], binary=False)
-        else:
-            raise ValueError(
-                f"unknown atom_pair_distogram_loss_type '{method}' "
-                "(expected 'prob', 'expected', or 'contact')")
-        terms.append(term)
-        if return_stats:
-            with torch.no_grad():
-                stats.append({
-                    'label': s['label'],
-                    'exp_dist': exp_d.item(),
-                    'mode_dist': mid_pts[torch.argmax(prob)].item(),
-                    'p_window': p_window.item(),
-                    'loss': term.item(),
-                    'lo': float(s['lo']), 'hi': float(s['hi']),
-                })
-    loss = torch.stack(terms).mean()
-    return (loss, stats) if return_stats else loss
-
-
-def get_atom_pair_coords_loss(sample_atom_coords, pair_specs, return_stats=False):
-    """Flat-bottom distance restraint on the sampled coords: zero inside [lo,hi],
-    squared violation outside, on the true Euclidean distance ||x_a - x_b||
-    (the only sensible computation for real coords -- no 'method' choice). Atom-
-    level on both sides (any named atom). Full mode only; carries a gradient only
-    with --attach_coords True (mirrors rg_loss / motif_coords_loss).
-
-    return_stats=True also returns per-pair diagnostics (detached) reusing the
-    computed distance, so the logged coord distance is exactly the optimized one."""
-    coords = sample_atom_coords[0]                        # [num_atoms, 3]
-    terms, stats = [], []
-    for s in pair_specs:
-        d = torch.linalg.norm(coords[s['atom_a']] - coords[s['atom_b']])
-        term = torch.relu(s['lo'] - d) ** 2 + torch.relu(d - s['hi']) ** 2
-        terms.append(term)
-        if return_stats:
-            stats.append({
-                'label': s['label'],
-                'dist': d.item(),
-                'loss': term.item(),
-                'lo': float(s['lo']), 'hi': float(s['hi']),
-            })
-    loss = torch.stack(terms).mean()
-    return (loss, stats) if return_stats else loss
 
 
 @dataclass
@@ -1707,6 +287,36 @@ def boltz_hallucination(
     # to build per-target token masks against batch['entity_id']. Defaults to a
     # single-target shim that auto-resolves from entity_id at setup time.
     target_chain_ids=None,
+    # Optional per-target residue selections that restrict WHICH target residues
+    # are visible to the inter-chain losses (epitope targeting). Chain-prefixed,
+    # 1-indexed residue positions within each target chain, range-aware:
+    # "B:50-70 B:95 C:1-10". The two selections are INDEPENDENT:
+    #   i_con_target_residues -> restricts the inter-chain CONTACT loss target side
+    #   i_pae_target_residues -> restricts the inter-chain PAE loss target side
+    # A target chain absent from a given spec keeps its FULL sequence for that
+    # loss (so with chains B,C and i_con_target_residues="B:50-70 B:95", chain C
+    # is still fully contacted). None/empty => full sequence for every target
+    # (legacy behavior, byte-identical). Intended for polymer targets (protein/
+    # peptide/dna/rna), where 1 token == 1 residue; for small_molecule/metal
+    # targets use the i_con_loss_weights / i_pae_loss_weights knobs to turn a
+    # term on/off rather than selecting residues.
+    i_con_target_residues=None,
+    i_pae_target_residues=None,
+    # Auxiliary INTER-TARGET losses: optimize contacts / interface-PAE BETWEEN
+    # two target chains (not the binder). Each entry is a pair-string
+    # "<sideA> | <sideB>" (also "<sideA> and <sideB>"), where each side is one or
+    # more CHAIN:RESNUM / CHAIN:start-end selections (comma/space separated) and
+    # both sides are target chains, e.g. "B:45-47 | C:52" or "B:103 | D:82-91,D:98".
+    # Computed with the SAME get_con_loss / get_pae_loss machinery as the
+    # binder<->target i_con/i_pae (the two target-residue selections become
+    # mask_1d / mask_1b). The two specs are independent; None/empty => no
+    # inter-target term (legacy). num/cutoff below mirror num_inter_contacts /
+    # inter_chain_cutoff for the contact term; the per-loss WEIGHTS live in
+    # loss_scales as 'inter_target_con_loss' / 'inter_target_pae_loss'.
+    inter_target_con_pairs=None,
+    inter_target_pae_pairs=None,
+    inter_target_num_contacts=2,
+    inter_target_cutoff=14.0,
     e_soft=0.8,
     e_soft_1=0.8,
     e_soft_2=1.0,
@@ -1716,6 +326,14 @@ def boltz_hallucination(
     use_temp=False,
     disconnect_feats=False,
     disconnect_pairformer=False,
+    # Independent grad-flow control from the diffusion sampler back to the
+    # sequence (vs. disconnect_feats/disconnect_pairformer which gate only the
+    # confidence head). disconnect_feats_structure detaches s_inputs into the
+    # sampler; disconnect_pairformer_structure detaches s_trunk/z_trunk. The
+    # s_inputs bypass is cut by default; the through-trunk route stays connected
+    # (mirrors the confidence head). Only matter in full mode with attach_coords=True.
+    disconnect_feats_structure=True,
+    disconnect_pairformer_structure=False,
     attach_coords=False,
     # Per-target boolean: when True (for a given target), that target's tokens
     # are masked during the warm-up (pre_iteration) stage so the binder evolves
@@ -1755,6 +373,15 @@ def boltz_hallucination(
     # are excluded from sliding placements. fix_motif_seq still applies -- the
     # pin moves with the MCMC state.
     motif_unindex_residues='',
+    # Placement method for the sliding islands: 'mcmc' (Metropolis on coords
+    # Kabsch RMSD, the existing path) or 'exhaustive' (deterministic exhaustive
+    # triplet enumeration on the trunk distogram; see motif_enum). Selected by
+    # --motif_slide_method. Inert without --motif_unindex_residues.
+    motif_slide_method='mcmc',
+    # Determinant score for the placement search (--motif_slide_loss):
+    # 'distogram' (fast-mode safe, every epoch), 'rmsd' or 'fape' (coords, full
+    # mode only). Independent of the motif_*_loss gradient weights.
+    motif_slide_loss='distogram',
     motif_slide_steps_per_epoch=10,
     motif_slide_T_init=5.0,
     motif_slide_T_final=0.1,
@@ -1769,16 +396,32 @@ def boltz_hallucination(
     # chain in the designed system (typically added via --target_mols).
     # Default '' = no ligand carry-along; backward-compat is byte-identical.
     motif_ligand_residues='',
+    # How the motif distogram restraint is computed: 'cross_entropy' (default;
+    # one-hot categorical CE supervised by the motif ground-truth distance, with
+    # the same diagonal/symmetry convention as the con/i_con contact losses) or
+    # 'mse' (bin-center MSE). See get_motif_distogram_loss.
+    motif_distogram_loss_type='cross_entropy',
+    # Optional mutable dict the caller passes to receive the motif-residue ->
+    # final-binder-position mapping (e.g. {"A30": "A27", ...}); populated after
+    # the design loop (final slide_state) for both fixed + sliding motifs. The
+    # caller writes it to JSON. None = don't build it (no overhead).
+    motif_mapping_out=None,
     # Explicit atom/residue distance restraints (--atom_pairs). Inactive unless
     # set, so existing runs are byte-for-byte unchanged. Weights come via
     # loss_scales['atom_pair_distogram_loss'/'atom_pair_coords_loss'].
     atom_pairs='',
-    # How the --atom_pairs distogram restraint is computed: 'expected' (default;
-    # bin-center MSE -- SwitchCraft Eq 1 for a point target, flat-bottom on E[d]
-    # for a window), 'prob' (-log P(d in window)), or 'contact' (BoltzDesign1's
-    # categorical contact loss; robust attractive gradient, large when far /
-    # tapering near). See get_atom_pair_distogram_loss.
-    atom_pair_distogram_loss_type='expected',
+    # How the --atom_pairs distogram restraint is computed: 'cross_entropy'
+    # (default; one-hot CE at the reference bin for a point target, -log P(d in
+    # window) for a window), 'expected' (bin-center MSE for a point target,
+    # flat-bottom on E[d] for a window), or 'contact' (BoltzDesign1's categorical
+    # contact loss; robust attractive gradient, large when far / tapering near).
+    # See get_atom_pair_distogram_loss.
+    atom_pair_distogram_loss_type='cross_entropy',
+    # Explicit three-atom angle restraints (--atom_angles). Inactive unless set.
+    # Coords-only (an angle is undefined on the trunk distogram): contributes a
+    # gradient only in full mode with --attach_coords True. Weight comes via
+    # loss_scales['atom_angle_coords_loss']. See get_atom_angle_coords_loss.
+    atom_angles='',
     # COM loss inputs. Inactive unless an HETATM ORI atom is found in --pdb_path
     # or --motif_pdb. pdb_path: original target PDB whose target chains seed
     # the Kabsch anchor (all non-binder atoms in `structure`). motif_pdb is
@@ -1791,6 +434,11 @@ def boltz_hallucination(
     # save_trajectory=True). intermediate_dir is set by the caller.
     save_intermediate_structures=False,
     intermediate_dir=None,
+    # Standardized final-fold metric settings (per-target-type defaults, NOT the
+    # run's optimization knobs). Passed straight to compute_final_metrics so the
+    # final con/i_con/helix loss values compare across differently-tuned runs.
+    # None => compute_final_metrics falls back to canonical defaults.
+    metric_config=None,
 ):
 
     # Sampler profile for the gradient design epochs. Installed on the model now
@@ -1989,6 +637,138 @@ def boltz_hallucination(
     # Pooled non-binder mask, used for binder-internal PAE term (binder ↔ binder).
     pooled_target_mask = (1 - chain_mask)
 
+    # ---- Residue-restricted target masks for the inter-chain losses ----------
+    # Epitope targeting: build a residue-subset version of each target_masks[ti]
+    # for the inter-chain CONTACT and PAE terms, independently. A polymer chain
+    # contributes its tokens in residue order, so residue r (1-indexed) is the
+    # (r-1)-th token of that chain. Chains not named in a spec keep their full
+    # mask, so a subset selection on one chain never silently masks the others.
+    def _chain_token_positions(c):
+        return torch.where(batch['entity_id'][0] == chain_to_number[c])[0]
+
+    def _parse_residue_selection(spec):
+        """'B:50-70 B:95 C:1-10' (also comma/semicolon separated) ->
+        {chain: set(1-indexed resnums)}. Empty/None -> {}."""
+        import re
+        sel = {}
+        if not spec:
+            return sel
+        for tok in (t for t in re.split(r'[\s,;]+', str(spec).strip()) if t):
+            if ':' not in tok:
+                raise ValueError(
+                    f"residue selection token {tok!r} must be CHAIN:RESNUM "
+                    f"or CHAIN:start-end (e.g. B:95 or B:50-70)")
+            ch, rng = tok.split(':', 1)
+            ch = ch.strip()
+            if '-' in rng:
+                lo, hi = (int(x) for x in rng.split('-', 1))
+                lo, hi = min(lo, hi), max(lo, hi)
+                rs = range(lo, hi + 1)
+            else:
+                rs = [int(rng)]
+            sel.setdefault(ch, set()).update(rs)
+        return sel
+
+    def _build_restricted_masks(spec, label):
+        """Per-target list of token masks: the full target mask for any chain
+        absent from `spec`, else that chain's mask zeroed outside the selected
+        residues. Mirrors target_masks shape/dtype/device exactly."""
+        sel = _parse_residue_selection(spec)
+        unknown = set(sel) - set(target_chain_ids)
+        if unknown:
+            raise ValueError(
+                f"{label}: chain(s) {sorted(unknown)} are not target chains "
+                f"{target_chain_ids}")
+        out = []
+        for ti, c in enumerate(target_chain_ids):
+            if c not in sel:
+                out.append(target_masks[ti])          # full chain (unchanged)
+                continue
+            positions = _chain_token_positions(c)      # token idx, residue order
+            L = int(positions.numel())
+            chosen = []
+            for r in sorted(sel[c]):
+                if not (1 <= r <= L):
+                    raise ValueError(
+                        f"{label}: chain {c} residue {r} out of range "
+                        f"[1, {L}] (chain has {L} token(s))")
+                chosen.append(positions[r - 1])
+            sub = torch.zeros_like(target_masks[ti])
+            sub[0, torch.stack(chosen)] = 1
+            out.append(sub)
+            print(f"[inter-mask] {label}: chain {c} restricted to "
+                  f"{len(chosen)}/{L} residues {sorted(sel[c])}")
+        return out
+
+    i_con_target_masks = _build_restricted_masks(
+        i_con_target_residues, 'i_con_target_residues')
+    i_pae_target_masks = _build_restricted_masks(
+        i_pae_target_residues, 'i_pae_target_residues')
+
+    # ---- Inter-target residue-pair masks (auxiliary cross-target losses) ------
+    # Optimize contacts / interface-PAE BETWEEN two target chains (never the
+    # binder). Each pair is "<sideA> | <sideB>" (also "<sideA> and <sideB>" /
+    # "<sideA> vs <sideB>"); each side is one or more CHAIN:RESNUM /
+    # CHAIN:start-end selections (comma/space separated). Both sides must be
+    # TARGET chains. We reuse the SAME residue->token resolution as the epitope
+    # masks above, then hand the two side-masks to the unchanged get_con_loss /
+    # get_pae_loss as mask_1d / mask_1b, so the math is identical to i_con/i_pae.
+    import re as _re_pair
+    _PAIR_SEP = _re_pair.compile(r'\s*\|\s*|\s+and\s+|\s+vs\s+', _re_pair.IGNORECASE)
+
+    def _selection_to_mask(sel, side_label):
+        """{chain: set(resnums)} -> [1, N] token mask over the selected target
+        residues (union across chains). Chains must be target chains."""
+        mask = torch.zeros_like(chain_mask)
+        for c in sorted(sel):
+            if c not in target_chain_ids:
+                raise ValueError(
+                    f"inter-target pair ({side_label}): chain {c} is not a "
+                    f"target chain {target_chain_ids}; inter-target losses are "
+                    f"target<->target only (use --i_con_target_residues / "
+                    f"--i_pae_target_residues for binder<->target selections)")
+            positions = _chain_token_positions(c)
+            L = int(positions.numel())
+            for r in sorted(sel[c]):
+                if not (1 <= r <= L):
+                    raise ValueError(
+                        f"inter-target pair ({side_label}): chain {c} residue {r}"
+                        f" out of range [1, {L}] (chain has {L} token(s))")
+                mask[0, positions[r - 1]] = 1
+        return mask
+
+    def _build_inter_target_pair_masks(pairs, label):
+        """List of (maskA, maskB, descriptor) per "<sideA>|<sideB>" pair.
+        `pairs` may be a list of pair-strings or a single string; empty -> []."""
+        if not pairs:
+            return []
+        if isinstance(pairs, str):
+            pairs = [pairs]
+        out = []
+        for raw in pairs:
+            raw = str(raw).strip()
+            if not raw:
+                continue
+            parts = _PAIR_SEP.split(raw, maxsplit=1)
+            if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+                raise ValueError(
+                    f"{label}: pair {raw!r} must have two sides separated by "
+                    f"'|' (or 'and'/'vs'), e.g. 'B:45-47 | C:52'")
+            mA = _selection_to_mask(_parse_residue_selection(parts[0]),
+                                    f"{label} sideA of {raw!r}")
+            mB = _selection_to_mask(_parse_residue_selection(parts[1]),
+                                    f"{label} sideB of {raw!r}")
+            desc = f"{parts[0].strip()} | {parts[1].strip()}"
+            out.append((mA, mB, desc))
+            print(f"[inter-target] {label}: {desc}  "
+                  f"(|A|={int(mA.sum().item())} tok, |B|={int(mB.sum().item())} tok)")
+        return out
+
+    inter_target_con_pair_masks = _build_inter_target_pair_masks(
+        inter_target_con_pairs, 'inter_target_con_pairs')
+    inter_target_pae_pair_masks = _build_inter_target_pair_masks(
+        inter_target_pae_pairs, 'inter_target_pae_pairs')
+
     # Useful diagnostic banner.
     print(f"[per-target] {n_targets} target chain(s): {target_chain_ids}")
     print(f"[per-target] i_con_loss weights : {i_con_w}")
@@ -2019,11 +799,33 @@ def boltz_hallucination(
     if (motif_fixed_active or motif_slide_active) and not motif_active:
         raise ValueError(
             "--motif_residues / --motif_unindex_residues require --motif_pdb")
+    if motif_slide_active:
+        if motif_slide_method not in ('mcmc', 'exhaustive'):
+            raise ValueError(
+                f"--motif_slide_method must be 'mcmc' or 'exhaustive', "
+                f"got {motif_slide_method!r}")
+        if motif_slide_loss not in ('distogram', 'rmsd', 'fape'):
+            raise ValueError(
+                f"--motif_slide_loss must be 'distogram', 'rmsd' or 'fape', "
+                f"got {motif_slide_loss!r}")
+        # Exhaustive enumeration runs the distogram determinant every epoch
+        # (fast-mode safe) and the rmsd/fape determinants on full-mode epochs
+        # (coords needed). The rmsd/fape exhaustive path supports only the
+        # default backbone selection (uniform atom grid); it is validated
+        # eagerly in `_build_slide_mp_coords` below.
     motif_token_idx = None        # LongTensor of token-axis indices (the binder
                                   # residues that hold the motif). Rebuilt per
                                   # epoch when sliding is active.
     motif_target_dist = None      # [M, M] raw reference pairwise distances (A)
     motif_onehot = None           # [M, V] hard res_type for sequence pinning
+    # slide_state captured at the moment of the last sequence pin (start of the
+    # final epoch). The placement search (MCMC/exhaustive) moves slide_state
+    # *after* the pin within get_model_loss, so the final folded sequence is
+    # pinned at THIS state, not the post-move one. The motif_mapping write and
+    # the semi-greedy mutation guard both read it so they match the actual
+    # binder sequence. None until the first pinned epoch (or if fix_motif_seq
+    # is off / no sliding motif).
+    _last_pin_slide_state = [None]
     if motif_active:
         # ----- Shared binder lookup helpers (used by both modes) -----
         binder_tok = torch.where(
@@ -2042,10 +844,31 @@ def boltz_hallucination(
             except ValueError:
                 return None
 
+        # Default atom set when a residue carries no explicit :ATOMS selection.
+        # The SAME resolved selection drives BOTH the coords Kabsch fit/RMSD and
+        # the FAPE scored set -- atom membership (incl. backbone N/CA/C/O) is
+        # controlled ONLY by the explicit selection; there is no hidden skip.
         _BB = ['N', 'CA', 'C', 'CB']
-        _SC_SKIP = {'N', 'CA', 'C', 'O', 'OXT'}
         V = batch['res_type'].shape[-1]
         N = batch['res_type'].shape[1]
+
+        def _resolve_sel(sel, atoms_dict, default_keys, label=''):
+            """Resolve a per-residue atom selection against the reference atom
+            dict. ``sel`` is None (-> ``default_keys``), 'ALL' (every heavy atom
+            present), or an explicit list of names. Warns on explicitly-requested
+            atoms that are absent in the reference."""
+            if sel is None:
+                names = [nm for nm in default_keys if nm in atoms_dict]
+            elif sel == 'ALL':
+                names = list(atoms_dict.keys())
+            else:
+                names = [nm for nm in sel if nm in atoms_dict]
+                _missing = [nm for nm in sel if nm not in atoms_dict]
+                if _missing:
+                    print(f"[motif] WARNING: {label} requested atom(s) "
+                          f"{_missing} absent in reference (have "
+                          f"{sorted(atoms_dict)}); skipped")
+            return names
 
         # ----- Fixed-mode setup (existing behavior) -----
         m_chain_residues = []
@@ -2062,10 +885,24 @@ def boltz_hallucination(
         # vectorization story; the user can run a final fix-position phase).
         motif_fape_active = False
         motif_frame_pred_idx = motif_fape_sc_pred_idx = motif_fape_loc_ref = None
+        # FAPE protos. FIXED residues contribute CONSTANT frames + scored atoms
+        # (collected in the fixed loop). SLIDING residues contribute DYNAMIC ones
+        # (collected in the sliding setup; their pred indices are rebuilt per
+        # epoch from slide_state). Carried ligand atoms are appended in the FAPE
+        # assembly after ligand parsing. loc_ref (the reference) is constant in
+        # all cases -- only sliding pred indices move.
+        _fape_fr_pred, _fape_fr_ref, _fape_sc_pred, _fape_sc_ref = [], [], [], []
+        _fape_fr_slide_slot, _fape_fr_ref_slide = [], []
+        _fape_sc_slide_slot, _fape_sc_slide_col, _fape_sc_ref_slide = [], [], []
+        _fape_fr_slide_cols = None
         if motif_fixed_active:
-            m_chain_residues = parse_motif_residue_spec(motif_residues)
-            if not m_chain_residues:
+            _parsed_motif = parse_motif_residue_spec(motif_residues, with_atoms=True)
+            if not _parsed_motif:
                 raise ValueError("--motif_residues set but parsed to no entries")
+            # Residue-level keys (distogram target, binder map, sliding conflict
+            # check) + the parallel per-residue atom selection (coords / FAPE).
+            m_chain_residues = [(c, r) for c, r, _ in _parsed_motif]
+            motif_atom_sel = [a for _, _, a in _parsed_motif]
             fixed_ref_xyz, fixed_motif_seq = extract_motif_coords(motif_pdb, m_chain_residues)
             M_fix = fixed_ref_xyz.shape[0]
             if motif_binder_positions:
@@ -2076,7 +913,17 @@ def boltz_hallucination(
                         f"--motif_binder_positions has {len(binder_pos)} entries "
                         f"but --motif_residues resolves to {M_fix} residues")
             else:
-                binder_pos = list(range(M_fix))
+                # No explicit positions: lay islands out back-to-back, honoring
+                # the per-island intra-offsets (so a fixed-gap spacer like
+                # "A38 3 A42" keeps A38, A42 four positions apart). With no
+                # spacers/ranges this reduces to range(M_fix) (legacy behavior).
+                _fixed_islands = parse_motif_islands_spec(motif_residues,
+                                                          flag='--motif_residues')
+                binder_pos, _base = [], 0
+                for _isl in _fixed_islands:
+                    for _rr in _isl:
+                        binder_pos.append(_base + _rr['intra_offset'])
+                    _base += island_length(_isl)
             if max(binder_pos) >= length:
                 raise ValueError(
                     f"motif binder position {max(binder_pos)+1} exceeds binder "
@@ -2085,41 +932,39 @@ def boltz_hallucination(
             fixed_token_idx_list = [int(binder_tok[p]) for p in binder_pos]
 
             _ref_res_atoms = extract_motif_residue_atoms(motif_pdb, m_chain_residues)
-            _fr_pred, _fr_ref, _sc_pred, _sc_ref = [], [], [], []
+            _unresolved = []  # explicitly-selected atoms absent on the UNK binder
             for _k, _pos in enumerate(binder_pos):
                 _ratoms = _ref_res_atoms[_k]['atoms']
-                for _nm in _BB:
+                _sel = motif_atom_sel[_k]
+                _c, _r = m_chain_residues[_k]
+                # ONE selected atom set per residue (default N,CA,C,CB) feeds BOTH
+                # the coords Kabsch fit/RMSD AND the FAPE scored set -- membership
+                # is controlled solely by the :ATOMS selection (no hidden skip).
+                _sel_names = _resolve_sel(_sel, _ratoms, _BB,
+                                          label=f"--motif_residues {_c}{_r}")
+                for _nm in _sel_names:
                     _pi = _pred_atom_idx(_pos, _nm)
-                    if _pi is not None and _nm in _ratoms:
-                        fixed_bb_pred_list.append(_pi)
+                    if _pi is not None:
+                        fixed_bb_pred_list.append(_pi)      # coords fit + RMSD
                         fixed_bb_ref_list.append(_ratoms[_nm])
-                if not motif_slide_active:
-                    _pN, _pCA, _pC = (_pred_atom_idx(_pos, _n) for _n in ('N', 'CA', 'C'))
-                    if (None not in (_pN, _pCA, _pC)
-                            and all(_n in _ratoms for _n in ('N', 'CA', 'C'))):
-                        _fr_pred.append([_pN, _pCA, _pC])
-                        _fr_ref.append([_ratoms['N'], _ratoms['CA'], _ratoms['C']])
-                    for _nm, _rc in _ratoms.items():
-                        if _nm in _SC_SKIP:
-                            continue
-                        _pi = _pred_atom_idx(_pos, _nm)
-                        if _pi is not None:
-                            _sc_pred.append(_pi)
-                            _sc_ref.append(_rc)
+                        _fape_sc_pred.append(_pi)            # FAPE scored atom
+                        _fape_sc_ref.append(_ratoms[_nm])
+                    elif _sel not in (None, 'ALL'):
+                        _unresolved.append(f"{_c}{_r}:{_nm}")
+                # FAPE frame per FIXED residue (needs N,CA,C; independent of the
+                # scored selection). CONSTANT pred indices.
+                _pN, _pCA, _pC = (_pred_atom_idx(_pos, _n) for _n in ('N', 'CA', 'C'))
+                if (None not in (_pN, _pCA, _pC)
+                        and all(_n in _ratoms for _n in ('N', 'CA', 'C'))):
+                    _fape_fr_pred.append([_pN, _pCA, _pC])
+                    _fape_fr_ref.append([_ratoms['N'], _ratoms['CA'], _ratoms['C']])
+            if _unresolved:
+                print(f"[motif] WARNING: selected coords atom(s) not present on "
+                      f"the (UNK) binder, so they do not contribute: "
+                      f"{_unresolved}. Build the residue type (--fix_motif_seq) "
+                      f"or pick atoms the binder has.")
             if not fixed_bb_pred_list:
-                raise ValueError("motif: no fixed-mode backbone atoms (N/CA/C/CB) could be resolved")
-            if not motif_slide_active:
-                motif_fape_active = bool(_fr_pred) and bool(_sc_pred)
-                if motif_fape_active:
-                    motif_frame_pred_idx = torch.as_tensor(_fr_pred, dtype=torch.long, device=device)
-                    motif_fape_sc_pred_idx = torch.as_tensor(_sc_pred, dtype=torch.long, device=device)
-                    _fr_ref_t = torch.as_tensor(np.asarray(_fr_ref), dtype=torch.float32, device=device)
-                    _sc_ref_t = torch.as_tensor(np.asarray(_sc_ref), dtype=torch.float32, device=device)
-                    with torch.no_grad():
-                        _Rr, _tr = _rigid_frames(_fr_ref_t[:, 0], _fr_ref_t[:, 1], _fr_ref_t[:, 2])
-                        _diff = _sc_ref_t[None, :, :] - _tr[:, None, :]
-                        motif_fape_loc_ref = torch.einsum('fij,fsj->fsi',
-                                                          _Rr.transpose(-1, -2), _diff)
+                raise ValueError("motif: no fixed-mode protein motif atoms could be resolved")
 
         # ----- Sliding-mode setup (--motif_unindex_residues) -----
         slide_islands = []
@@ -2128,7 +973,7 @@ def boltz_hallucination(
         slide_motif_seq = ''
         slide_ref_xyz = np.zeros((0, 3), dtype=np.float32)
         slide_atom_res_idx = slide_atom_within_idx = slide_atom_ref_xyz = None
-        binder_bb_atom_idx = None
+        binder_slide_atom_idx = None
         slide_runtime = None
         M_slide = 0
         if motif_slide_active:
@@ -2154,31 +999,77 @@ def boltz_hallucination(
             slide_ref_xyz, slide_motif_seq = extract_motif_coords(motif_pdb, slide_chain_residues)
             _slide_ref_res_atoms = extract_motif_residue_atoms(motif_pdb, slide_chain_residues)
 
-            # Precompute binder backbone atom index map [length, 4]: maps each
-            # binder position + (N/CA/C/CB) -> global atom index. Stable across
-            # all MCMC moves (only depends on the binder structure layout).
-            binder_bb_atom_idx = torch.full((length, 4), -1, dtype=torch.long, device=device)
+            # Per-residue atom selection (shared :ATOMS grammar), aligned with
+            # slide_chain_residues / _slide_ref_res_atoms (island-then-residue).
+            slide_atom_sel = [r['atoms'] for isl in slide_islands for r in isl]
+
+            # Collect, per sliding residue (keyed by motif slot + atom NAME, so
+            # the binder position can be resolved per epoch via slide_state). ONE
+            # selected atom set per residue (default N,CA,C,CB) feeds BOTH the
+            # coords loss AND the FAPE scored set; the FAPE frame additionally
+            # needs N,CA,C. Binder presence is filtered after the index map.
+            _slide_specs = []                       # (slot, name, ref_xyz)  coords + FAPE scored
+            _slide_names = {'N', 'CA', 'C'}         # frames always need N,CA,C
+            _fr_slide_proto = []                    # (slot, [N_ref,CA_ref,C_ref])
+            for _ri, ent in enumerate(_slide_ref_res_atoms):
+                _c, _r = slide_chain_residues[_ri]
+                _ra = ent['atoms']
+                for _nm in _resolve_sel(slide_atom_sel[_ri], _ra, _BB,
+                                        label=f"--motif_unindex_residues {_c}{_r}"):
+                    _slide_specs.append((_ri, _nm, _ra[_nm]))
+                    _slide_names.add(_nm)
+                if all(_n in _ra for _n in ('N', 'CA', 'C')):
+                    _fr_slide_proto.append((_ri, [_ra['N'], _ra['CA'], _ra['C']]))
+            _sc_slide_proto = _slide_specs          # FAPE scored == coords selection
+            if not _slide_specs:
+                raise ValueError("sliding motif: no usable atoms in the motif PDB")
+
+            # Binder atom-index map [length, n_names] over the UNION of needed
+            # names (coords + N,CA,C frames + FAPE sidechain): binder position +
+            # atom name -> global atom index (-1 if absent). Stable across MCMC.
+            _slide_name_list = sorted(_slide_names)
+            _slide_name_col = {nm: c for c, nm in enumerate(_slide_name_list)}
+            binder_slide_atom_idx = torch.full((length, len(_slide_name_list)), -1,
+                                               dtype=torch.long, device=device)
             for _p in range(length):
-                for _j, _nm in enumerate(_BB):
+                for _nm, _c in _slide_name_col.items():
                     _idx = _pred_atom_idx(_p, _nm)
                     if _idx is not None:
-                        binder_bb_atom_idx[_p, _j] = _idx
+                        binder_slide_atom_idx[_p, _c] = _idx
 
-            # Per-(residue, atom) specs for sliding side: only atoms present on
-            # both motif PDB and the UNK binder.
-            _slide_specs = []
-            for _ri, ent in enumerate(_slide_ref_res_atoms):
-                for _ai, _nm in enumerate(_BB):
-                    if _nm in ent['atoms']:
-                        _slide_specs.append((_ri, _ai, ent['atoms'][_nm]))
-            if not _slide_specs:
-                raise ValueError("sliding motif: no usable backbone atoms")
-            slide_atom_res_idx = torch.as_tensor([s[0] for s in _slide_specs],
+            def _on_binder(nm):
+                _c = _slide_name_col.get(nm)
+                return _c is not None and bool((binder_slide_atom_idx[:, _c] >= 0).all())
+
+            # Coords specs: keep atoms present at every binder position (UNK is uniform).
+            _kept = []
+            for (_ri, _nm, _xyz) in _slide_specs:
+                if _on_binder(_nm):
+                    _kept.append((_ri, _slide_name_col[_nm], _xyz))
+                else:
+                    print(f"[motif/slide] WARNING: atom '{_nm}' not on the UNK "
+                          f"binder; dropped from the coords loss")
+            if not _kept:
+                raise ValueError("sliding motif: no selected atoms present on the binder")
+            slide_atom_res_idx = torch.as_tensor([s[0] for s in _kept],
                                                   dtype=torch.long, device=device)
-            slide_atom_within_idx = torch.as_tensor([s[1] for s in _slide_specs],
+            slide_atom_within_idx = torch.as_tensor([s[1] for s in _kept],
                                                      dtype=torch.long, device=device)
-            slide_atom_ref_xyz = torch.as_tensor(np.stack([s[2] for s in _slide_specs]),
+            slide_atom_ref_xyz = torch.as_tensor(np.stack([s[2] for s in _kept]),
                                                   dtype=torch.float32, device=device)
+
+            # Sliding FAPE protos (DYNAMIC pred idx; filtered to binder presence).
+            # Frames need N,CA,C present on the binder (uniform for UNK).
+            if all(_on_binder(_n) for _n in ('N', 'CA', 'C')):
+                _fape_fr_slide_cols = [_slide_name_col[_n] for _n in ('N', 'CA', 'C')]
+                for (_ri, _ref3) in _fr_slide_proto:
+                    _fape_fr_slide_slot.append(_ri)
+                    _fape_fr_ref_slide.append(_ref3)
+            for (_ri, _nm, _xyz) in _sc_slide_proto:
+                if _on_binder(_nm):
+                    _fape_sc_slide_slot.append(_ri)
+                    _fape_sc_slide_col.append(_slide_name_col[_nm])
+                    _fape_sc_ref_slide.append(_xyz)
 
             import random as _random
             _slide_rng = _random.Random(123)
@@ -2218,6 +1109,12 @@ def boltz_hallucination(
         motif_target_dist = get_motif_target_distances(
             combined_ref_xyz, device=device)
         motif_onehot = torch.zeros(M, V, device=device, dtype=batch['res_type'].dtype)
+
+        # res_type column for each one-letter AA, matching the alphabet used
+        # throughout boltz_hallucination: list('XXARNDCQEGHILKMFPSTWYV-').
+        _ALPHABET = list('XXARNDCQEGHILKMFPSTWYV-')
+        _AA_TO_COL = {aa: i for i, aa in enumerate(_ALPHABET) if i >= 2 and aa not in ('X', '-')}
+
         for j, aa in enumerate(motif_seq):
             col = _AA_TO_COL.get(aa)
             if col is None:
@@ -2234,6 +1131,20 @@ def boltz_hallucination(
             motif_bb_ref_xyz = _bb_ref_fixed_t
         _K_fix = _bb_ref_fixed_t.shape[0]
         _K_total = motif_bb_ref_xyz.shape[0]
+        # The Kabsch fit (motif_coords_loss) is over these selected protein
+        # atoms; it needs >=3 non-collinear points for a defined rotation.
+        if _K_total < 3:
+            raise ValueError(
+                f"motif_coords_loss Kabsch fit needs >=3 selected protein "
+                f"atoms; got {_K_total}. Widen the --motif_residues atom "
+                f"selection (ligand atoms do not count toward the fit).")
+        with torch.no_grad():
+            _ref_centered = motif_bb_ref_xyz - motif_bb_ref_xyz.mean(0, keepdim=True)
+            if int(torch.linalg.matrix_rank(_ref_centered)) < 2:
+                raise ValueError(
+                    "motif_coords_loss: selected protein atoms are collinear "
+                    "(rank<2); the Kabsch rotation is undefined. Select atoms "
+                    "that span more than a line.")
         # Static fixed backbone idx (used by the dynamic rebuilder + MCMC energy)
         motif_bb_pred_idx_fixed_static = (
             torch.as_tensor(fixed_bb_pred_list, dtype=torch.long, device=device)
@@ -2244,6 +1155,10 @@ def boltz_hallucination(
         motif_bb_pred_idx = torch.zeros(_K_total, dtype=torch.long, device=device)
         motif_row_mask = torch.zeros(1, N, 1, device=device, dtype=batch['res_type'].dtype)
         motif_res_type_full = torch.zeros(1, N, V, device=device, dtype=batch['res_type'].dtype)
+        # Holder for the sliding-FAPE rebuild closure (set in the FAPE assembly
+        # below, after ligand parsing). Called after each MCMC step so the FAPE
+        # frame/scored pred indices track slide_state. None when FAPE is inactive.
+        _slide_fape_rebuild = [None]
 
         def _rebuild_motif_dynamic():
             """Repopulate ``motif_token_idx`` / ``motif_bb_pred_idx`` /
@@ -2261,7 +1176,7 @@ def boltz_hallucination(
                     positions_t = torch.as_tensor(positions, dtype=torch.long, device=device)
                     motif_token_idx[M_fix:] = binder_tok[positions_t]
                     positions_per_atom = positions_t[slide_atom_res_idx]
-                    motif_bb_pred_idx[_K_fix:] = binder_bb_atom_idx[
+                    motif_bb_pred_idx[_K_fix:] = binder_slide_atom_idx[
                         positions_per_atom, slide_atom_within_idx]
                 # Sequence pin masks: re-stamp from scratch each call (sliding
                 # rows move; previously-pinned rows must be cleared).
@@ -2273,36 +1188,79 @@ def boltz_hallucination(
                         motif_row_mask[0, tok, 0] = 1.0
                         motif_res_type_full[0, tok, :] = motif_onehot[j]
 
-        def _placement_energy_state(state, coords_det):
-            """Backbone Kabsch RMSD under a candidate placement (no grad).
-            Concatenates the fixed bb idx (constant) with the sliding bb idx
-            computed from ``state`` and uses the existing coord-loss kernel."""
-            with torch.no_grad():
-                positions = _placement_to_positions(state, slide_islands)
-                positions_t = torch.as_tensor(positions, dtype=torch.long, device=device)
-                positions_per_atom = positions_t[slide_atom_res_idx]
-                slide_bb_pred = binder_bb_atom_idx[positions_per_atom, slide_atom_within_idx]
-                if motif_fixed_active:
-                    bb_pred_idx_state = torch.cat(
-                        [motif_bb_pred_idx_fixed_static, slide_bb_pred], dim=0)
-                else:
-                    bb_pred_idx_state = slide_bb_pred
-                # coords_det is [1, n_atoms, 3]
-                return float(get_motif_coords_loss(
-                    coords_det, bb_pred_idx_state, motif_bb_ref_xyz).item())
+        # ---- Candidate-placement scoring for the placement search ----
+        # The determinant (--motif_slide_loss) is computed for a *candidate*
+        # slide_state with the SAME motif loss kernel as the matching gradient
+        # term, over the WHOLE motif (fixed anchors ++ sliding-at-candidate), so
+        # sliding islands are placed relative to the fixed motif -- exactly what
+        # the old coords-only energy did via the joint Kabsch.
+        def _candidate_bb_pred_idx(state):
+            positions_t = torch.as_tensor(
+                _placement_to_positions(state, slide_islands),
+                dtype=torch.long, device=device)
+            slide_bb_pred = binder_slide_atom_idx[
+                positions_t[slide_atom_res_idx], slide_atom_within_idx]
+            if motif_fixed_active:
+                return torch.cat([motif_bb_pred_idx_fixed_static, slide_bb_pred], dim=0)
+            return slide_bb_pred
 
-        def _mcmc_step_with_coords(coords_det):
-            """Run motif_slide_steps_per_epoch MCMC moves on slide_state using
-            the current (detached) predicted coords as the energy surface. T
-            anneals from T_init to T_final exponentially over the expected
-            total iteration count. Refreshes the dynamic tensors at the end."""
-            if not motif_slide_active or coords_det is None:
+        def _candidate_token_idx(state):
+            tok = motif_token_idx.clone()                # fixed prefix is constant
+            positions_t = torch.as_tensor(
+                _placement_to_positions(state, slide_islands),
+                dtype=torch.long, device=device)
+            tok[M_fix:] = binder_tok[positions_t]
+            return tok
+
+        def _candidate_fape_idx(state):
+            fr = motif_frame_pred_idx.clone()
+            sc = motif_fape_sc_pred_idx.clone()
+            positions_t = torch.as_tensor(
+                _placement_to_positions(state, slide_islands),
+                dtype=torch.long, device=device)
+            if _F_slide and _fr_slide_cols_t is not None:
+                fr[_F_fix:] = binder_slide_atom_idx[
+                    positions_t[_fr_slide_slot_t]][:, _fr_slide_cols_t]
+            if _S_slide:
+                sc[_sc_const_n:] = binder_slide_atom_idx[
+                    positions_t[_sc_slide_slot_t], _sc_slide_col_t]
+            return fr, sc
+
+        def _placement_energy(state, dict_out, pdist, mid_pts):
+            """Determinant score (lower = better fit) for a candidate placement.
+            Returns None when --motif_slide_loss needs the diffusion coords but
+            they are unavailable this epoch (fast mode)."""
+            with torch.no_grad():
+                if motif_slide_loss == 'distogram':
+                    return float(get_motif_distogram_loss(
+                        pdist, _candidate_token_idx(state), motif_target_dist,
+                        mid_pts, method=motif_distogram_loss_type))
+                coords = dict_out.get('sample_atom_coords')
+                if coords is None:
+                    return None
+                if motif_slide_loss == 'rmsd':
+                    return float(get_motif_coords_loss(
+                        coords, _candidate_bb_pred_idx(state), motif_bb_ref_xyz))
+                if motif_slide_loss == 'fape':
+                    if not motif_fape_active:
+                        return None
+                    fr, sc = _candidate_fape_idx(state)
+                    return float(get_motif_fape_loss(
+                        coords, fr, sc, motif_fape_loc_ref))
+            return None
+
+        def _mcmc_step(dict_out, pdist, mid_pts):
+            """One epoch of Metropolis + simulated-annealing moves on slide_state
+            using the --motif_slide_loss determinant as the energy. No-op (and no
+            call-count increment) when the determinant is unavailable this epoch,
+            so the T schedule advances only on epochs that actually search."""
+            E_cur = _placement_energy(slide_state, dict_out, pdist, mid_pts)
+            if E_cur is None:
                 return
             t = min(slide_runtime['call_count']
                     / float(slide_runtime['total_calls']), 1.0)
             T = motif_slide_T_init * (motif_slide_T_final
                                        / motif_slide_T_init) ** t
-            E_cur = _placement_energy_state(slide_state, coords_det)
             for _ in range(int(motif_slide_steps_per_epoch)):
                 slide_runtime['attempts'] += 1
                 prop = propose_mcmc_move(slide_state, slide_island_lengths,
@@ -2312,7 +1270,7 @@ def boltz_hallucination(
                                           slide_runtime['rng'])
                 if prop is None:
                     continue
-                E_prop = _placement_energy_state(prop, coords_det)
+                E_prop = _placement_energy(prop, dict_out, pdist, mid_pts)
                 dE = E_prop - E_cur
                 if dE < 0 or slide_runtime['rng'].random() < math.exp(-dE / T):
                     for i in range(len(slide_state)):
@@ -2323,9 +1281,181 @@ def boltz_hallucination(
             slide_runtime['current_T'] = T
             slide_runtime['current_E'] = E_cur
             _rebuild_motif_dynamic()
+            if _slide_fape_rebuild[0] is not None:
+                _slide_fape_rebuild[0]()
+
+        # ---- Exhaustive placement (motif_enum), distogram determinant ----
+        # Built lazily once: contigs = fixed anchors (single pinned start each) ++
+        # sliding islands (free, minus fixed-occupied positions). Holder stores
+        # (problem, sliding_contig_indices, token_map).
+        _slide_mp_holder = [None]
+
+        def _build_slide_mp():
+            import motif_enum as _me
+            refs, offsets, valid_starts, sliding_idx = [], [], [], []
+            # Fixed motif residues anchor the sliding placement: one pinned
+            # single-residue contig each, at its exact binder position (robust to
+            # the --motif_binder_positions layout). Their pairwise geometry to the
+            # sliding islands is what makes the search place relative to the fixed
+            # motif, mirroring the MCMC joint-Kabsch energy.
+            if motif_fixed_active:
+                for _k, _pos in enumerate(binder_pos):
+                    refs.append(torch.as_tensor(
+                        fixed_ref_xyz[_k], dtype=torch.float32,
+                        device=device).reshape(1, 1, 3))
+                    offsets.append([0])
+                    valid_starts.append([int(_pos)])
+            _ri = 0
+            for _isl in slide_islands:
+                _n = len(_isl)
+                _off = [r['intra_offset'] for r in _isl]
+                _span = max(_off) + 1
+                refs.append(torch.as_tensor(
+                    slide_ref_xyz[_ri:_ri + _n], dtype=torch.float32,
+                    device=device).reshape(_n, 1, 3))
+                offsets.append(_off)
+                valid_starts.append([
+                    s for s in range(length - _span + 1)
+                    if all((s + o) not in fixed_positions for o in range(_span))])
+                sliding_idx.append(len(refs) - 1)
+                _ri += _n
+            problem = _me.MotifPlacementProblem(
+                refs, length, contig_offsets=offsets, contig_valid_starts=valid_starts)
+            return problem, sliding_idx, binder_tok
+
+        # ---- Coords variant (rmsd/fape determinant): identical contig layout
+        # to _build_slide_mp, but the refs carry the backbone atom set [n,A,3]
+        # and we also resolve a [length, A] gather index into sample_atom_coords.
+        # Default-backbone selection only -- the engine's coords scorers need a
+        # uniform per-residue atom grid (A = the subset of N,CA,C,CB present in
+        # every motif reference residue AND on the UNK binder).
+        _slide_mp_coords_holder = [None]
+
+        def _build_slide_mp_coords():
+            import motif_enum as _me
+            _sels = (list(motif_atom_sel) if motif_fixed_active else []) \
+                + list(slide_atom_sel)
+            if any(s is not None for s in _sels):
+                raise ValueError(
+                    "--motif_slide_method exhaustive with --motif_slide_loss "
+                    "rmsd/fape supports only the default backbone selection "
+                    "(no per-residue :ATOMS); use --motif_slide_method mcmc for "
+                    "custom atom selections")
+            _ref_dicts = ([e['atoms'] for e in _ref_res_atoms]
+                          if motif_fixed_active else [])
+            _ref_dicts += [e['atoms'] for e in _slide_ref_res_atoms]
+            names = [nm for nm in _BB
+                     if all(nm in d for d in _ref_dicts)
+                     and nm in _slide_name_col
+                     and bool((binder_slide_atom_idx[:, _slide_name_col[nm]]
+                               >= 0).all())]
+            if len(names) < 3:
+                raise ValueError(
+                    f"exhaustive rmsd/fape needs >=3 uniform backbone atoms "
+                    f"across all motif residues + the binder; resolved {names}. "
+                    f"Use --motif_slide_method mcmc.")
+            cols = torch.as_tensor([_slide_name_col[nm] for nm in names],
+                                   dtype=torch.long, device=device)
+            A = len(names)
+            pred_idx = binder_slide_atom_idx[:, cols]                # [length, A]
+            refs, offsets, valid_starts, sliding_idx = [], [], [], []
+            if motif_fixed_active:
+                for _k, _pos in enumerate(binder_pos):
+                    _d = _ref_res_atoms[_k]['atoms']
+                    refs.append(torch.as_tensor(
+                        np.stack([_d[nm] for nm in names]),
+                        dtype=torch.float32, device=device).reshape(1, A, 3))
+                    offsets.append([0])
+                    valid_starts.append([int(_pos)])
+            _ri = 0
+            for _isl in slide_islands:
+                _n = len(_isl)
+                _off = [r['intra_offset'] for r in _isl]
+                _span = max(_off) + 1
+                _isl_ref = np.stack([
+                    np.stack([_slide_ref_res_atoms[_ri + _j]['atoms'][nm]
+                              for nm in names])
+                    for _j in range(_n)])                            # [n, A, 3]
+                refs.append(torch.as_tensor(
+                    _isl_ref, dtype=torch.float32, device=device))
+                offsets.append(_off)
+                valid_starts.append([
+                    s for s in range(length - _span + 1)
+                    if all((s + o) not in fixed_positions for o in range(_span))])
+                sliding_idx.append(len(refs) - 1)
+                _ri += _n
+            problem = _me.MotifPlacementProblem(
+                refs, length, contig_offsets=offsets, contig_valid_starts=valid_starts)
+            return problem, sliding_idx, pred_idx, names
+
+        def _apply_slide_placement(placement, sliding_idx, beta):
+            """Write an enumeration result into slide_state and refresh the
+            dynamic motif tensors (shared by both exhaustive determinants)."""
+            new_state = [int(placement[ci]) for ci in sliding_idx]
+            slide_runtime['call_count'] += 1
+            slide_runtime['current_T'] = beta
+            if new_state != list(slide_state):
+                for i in range(len(slide_state)):
+                    slide_state[i] = new_state[i]
+                _rebuild_motif_dynamic()
+                if _slide_fape_rebuild[0] is not None:
+                    _slide_fape_rebuild[0]()
+
+        def _exhaustive_step(dict_out, pdist, mid_pts):
+            """Deterministic placement by exhaustive triplet enumeration
+            (motif_enum); writes the best joint placement to slide_state. beta
+            anneals 2 -> 20 over the run. The distogram determinant runs every
+            epoch; rmsd/fape need the diffusion coords (full-mode epochs only)
+            and are a no-op otherwise."""
+            import motif_enum as _me
+            t = min(slide_runtime['call_count']
+                    / float(slide_runtime['total_calls']), 1.0)
+            beta = 2.0 + (20.0 - 2.0) * t
+            if motif_slide_loss == 'distogram':
+                if _slide_mp_holder[0] is None:
+                    _slide_mp_holder[0] = _build_slide_mp()
+                problem, sliding_idx, token_map = _slide_mp_holder[0]
+                with torch.no_grad():
+                    scores = _me.distogram_ce_pair_scores(
+                        pdist.detach(), problem, token_map=token_map)
+                    placement = _me.best_placement(scores, problem, beta=beta)
+                _apply_slide_placement(placement, sliding_idx, beta)
+                return
+            # rmsd / fape determinant: coords needed -> full-mode epochs only.
+            coords = dict_out.get('sample_atom_coords')
+            if coords is None:
+                return
+            if _slide_mp_coords_holder[0] is None:
+                _slide_mp_coords_holder[0] = _build_slide_mp_coords()
+            problem, sliding_idx, pred_idx, _names = _slide_mp_coords_holder[0]
+            pred = coords[0][pred_idx]                                # [length, A, 3]
+            score_fn = (_me.fape_pair_scores if motif_slide_loss == 'fape'
+                        else _me.kabsch_rmsd_pair_scores)
+            with torch.no_grad():
+                scores = score_fn(pred, problem)
+                placement = _me.best_placement(scores, problem, beta=beta)
+            _apply_slide_placement(placement, sliding_idx, beta)
+
+        def _run_slide_placement(dict_out, pdist, mid_pts):
+            """Per-epoch placement update (called before the motif gradient losses
+            so they see the new placement). Dispatches on --motif_slide_method."""
+            if not motif_slide_active:
+                return
+            if motif_slide_method == 'mcmc':
+                _mcmc_step(dict_out, pdist, mid_pts)
+            else:
+                _exhaustive_step(dict_out, pdist, mid_pts)
 
         # Initialize dynamic tensors from the initial slide_state.
         _rebuild_motif_dynamic()
+
+        # Front-load the coords-exhaustive validation (default-backbone, uniform
+        # atom grid) so a bad config errors at setup, not on the first full-mode
+        # epoch. The build needs no coords (refs + indices only), so it is safe
+        # to run here and cache.
+        if (motif_slide_active and motif_slide_method == 'exhaustive'
+                and motif_slide_loss in ('rmsd', 'fape')):
+            _slide_mp_coords_holder[0] = _build_slide_mp_coords()
 
         # Optional ligand carry-along (--motif_ligand_residues). The Kabsch
         # transform is fit from the motif backbone above (joint over fixed +
@@ -2333,12 +1463,14 @@ def boltz_hallucination(
         motif_lig_active = bool(motif_ligand_residues)
         motif_lig_pred_idx = motif_lig_ref_xyz = None
         if motif_lig_active:
-            _lig_specs = parse_motif_ligand_spec(motif_ligand_residues)
-            if not _lig_specs:
+            _lig_specs_full = parse_motif_ligand_spec(motif_ligand_residues, with_atoms=True)
+            if not _lig_specs_full:
                 raise ValueError("--motif_ligand_residues set but parsed to no entries")
+            _lig_specs = [(c, r) for c, r, _ in _lig_specs_full]
+            _lig_atom_sel = [a for _, _, a in _lig_specs_full]
             _ref_lig = extract_motif_ligand_atoms(motif_pdb, _lig_specs)
             _lig_pred, _lig_ref, _lig_summary = [], [], []
-            for _ent in _ref_lig:
+            for _ei, _ent in enumerate(_ref_lig):
                 _match_chain = _match_res = None
                 for _c in structure.chains:
                     _r0 = int(_c['res_idx']); _rn = int(_c['res_num'])
@@ -2357,7 +1489,10 @@ def boltz_hallucination(
                         f"ligand is in the YAML (e.g. --target_mols "
                         f"{_ent['resname']}).")
                 _n_match = 0
-                for _nm, _xyz in _ent['atoms'].items():
+                _use_names = _resolve_sel(
+                    _lig_atom_sel[_ei], _ent['atoms'], list(_ent['atoms'].keys()),
+                    label=f"--motif_ligand_residues {_ent['chain']}{_ent['resnum']}")
+                for _nm in _use_names:
                     try:
                         _pi = _find_named_atom(structure,
                                                int(_match_res['atom_idx']),
@@ -2366,12 +1501,12 @@ def boltz_hallucination(
                     except ValueError:
                         continue
                     _lig_pred.append(_pi)
-                    _lig_ref.append(_xyz)
+                    _lig_ref.append(_ent['atoms'][_nm])
                     _n_match += 1
                 _lig_summary.append(
                     f"{_ent['chain']}{_ent['resnum']}({_ent['resname']})->"
                     f"{str(_match_chain['name'])}:"
-                    f"{_n_match}/{len(_ent['atoms'])}atoms")
+                    f"{_n_match}/{len(_use_names)}atoms")
             if not _lig_pred:
                 raise ValueError(
                     "--motif_ligand_residues set but no ligand atoms resolved "
@@ -2383,33 +1518,118 @@ def boltz_hallucination(
             print(f"[motif] ligand carry-along over {len(_lig_pred)} atoms: "
                   + ", ".join(_lig_summary))
 
+        # ----- FAPE assembly (fixed + sliding + ligand) -----
+        # Canonical order: frames = [fixed frames ++ sliding frames]; scored
+        # atoms = [fixed sidechain ++ ligand ++ sliding sidechain]. loc_ref (the
+        # reference, motif PDB geometry) is CONSTANT; only the SLIDING pred
+        # indices move with slide_state, rebuilt by `_fill_slide_fape` (init +
+        # after each MCMC step). The SAME flags that feed motif_coords_loss
+        # (--motif_residues / --motif_unindex_residues / --motif_ligand_residues)
+        # thus all feed motif_fape_loss; ligand atoms are scored as points in
+        # the motif frames (frame-aligned ligand placement).
+        _F_fix, _F_slide = len(_fape_fr_pred), len(_fape_fr_slide_slot)
+        _S_fix = len(_fape_sc_pred)
+        _n_lig_fape = (int(motif_lig_pred_idx.shape[0])
+                       if (motif_lig_active and motif_lig_pred_idx is not None) else 0)
+        _S_slide = len(_fape_sc_slide_slot)
+        motif_fape_active = ((_F_fix + _F_slide) > 0
+                             and (_S_fix + _n_lig_fape + _S_slide) > 0)
+        if motif_fape_active:
+            _fr_ref_all = list(_fape_fr_ref) + list(_fape_fr_ref_slide)          # [F,3,3]
+            _sc_ref_all = list(_fape_sc_ref)                                     # fixed sc
+            if _n_lig_fape:
+                _sc_ref_all = _sc_ref_all + [r for r in motif_lig_ref_xyz.cpu().numpy()]
+            _sc_ref_all = _sc_ref_all + list(_fape_sc_ref_slide)                 # [S,3]
+            _fr_ref_t = torch.as_tensor(np.asarray(_fr_ref_all), dtype=torch.float32, device=device)
+            _sc_ref_t = torch.as_tensor(np.asarray(_sc_ref_all), dtype=torch.float32, device=device)
+            with torch.no_grad():
+                _Rr, _tr = _rigid_frames(_fr_ref_t[:, 0], _fr_ref_t[:, 1], _fr_ref_t[:, 2])
+                _diff = _sc_ref_t[None, :, :] - _tr[:, None, :]
+                motif_fape_loc_ref = torch.einsum('fij,fsj->fsi',
+                                                  _Rr.transpose(-1, -2), _diff)
+            # Mutable pred-index tensors: constant prefixes set now, sliding
+            # suffixes filled by _fill_slide_fape (init + per MCMC step).
+            _F, _S = _F_fix + _F_slide, _S_fix + _n_lig_fape + _S_slide
+            motif_frame_pred_idx = torch.zeros(_F, 3, dtype=torch.long, device=device)
+            motif_fape_sc_pred_idx = torch.zeros(_S, dtype=torch.long, device=device)
+            if _F_fix:
+                motif_frame_pred_idx[:_F_fix] = torch.as_tensor(_fape_fr_pred, dtype=torch.long, device=device)
+            _sc_const = list(_fape_sc_pred) + (motif_lig_pred_idx.tolist() if _n_lig_fape else [])
+            if _sc_const:
+                motif_fape_sc_pred_idx[:len(_sc_const)] = torch.as_tensor(_sc_const, dtype=torch.long, device=device)
+            _sc_const_n = len(_sc_const)
+            _fr_slide_slot_t = (torch.as_tensor(_fape_fr_slide_slot, dtype=torch.long, device=device)
+                                if _F_slide else None)
+            _fr_slide_cols_t = (torch.as_tensor(_fape_fr_slide_cols, dtype=torch.long, device=device)
+                                if (_F_slide and _fape_fr_slide_cols is not None) else None)
+            _sc_slide_slot_t = (torch.as_tensor(_fape_sc_slide_slot, dtype=torch.long, device=device)
+                                if _S_slide else None)
+            _sc_slide_col_t = (torch.as_tensor(_fape_sc_slide_col, dtype=torch.long, device=device)
+                               if _S_slide else None)
+
+            def _fill_slide_fape():
+                """Rebuild the SLIDING portion of the FAPE pred-index tensors from
+                the current slide_state (constant prefixes untouched; loc_ref is
+                constant). No-op without sliding."""
+                if not motif_slide_active:
+                    return
+                with torch.no_grad():
+                    positions_t = torch.as_tensor(
+                        _placement_to_positions(slide_state, slide_islands),
+                        dtype=torch.long, device=device)
+                    if _F_slide and _fr_slide_cols_t is not None:
+                        motif_frame_pred_idx[_F_fix:] = \
+                            binder_slide_atom_idx[positions_t[_fr_slide_slot_t]][:, _fr_slide_cols_t]
+                    if _S_slide:
+                        motif_fape_sc_pred_idx[_sc_const_n:] = \
+                            binder_slide_atom_idx[positions_t[_sc_slide_slot_t], _sc_slide_col_t]
+
+            _slide_fape_rebuild[0] = _fill_slide_fape
+            _fill_slide_fape()   # initial fill from the initial slide_state
+
         # ----- Startup summary -----
         if motif_fixed_active:
             _motif_chains = sorted({c for c, _ in m_chain_residues})
+            _any_sel = any(a is not None for a in motif_atom_sel)
             print(f"[motif/fixed] {M_fix} residues from {motif_pdb} "
                   f"chain(s) {','.join(_motif_chains)} "
                   f"({','.join(f'{c}{r}' for c, r in m_chain_residues)}) "
                   f"-> binder positions {[p+1 for p in binder_pos]}; "
-                  f"seq={fixed_motif_seq}; fix_seq={bool(fix_motif_seq)}")
+                  f"seq={fixed_motif_seq}; fix_seq={bool(fix_motif_seq)}; "
+                  f"atom_sel={'per-residue' if _any_sel else 'default(N,CA,C,CB / sidechain)'}; "
+                  f"Kabsch-fit atoms={_K_total}")
         if motif_fape_active:
             _n_fr = int(motif_frame_pred_idx.shape[0])
             _n_sc = int(motif_fape_sc_pred_idx.shape[0])
-            print(f"[motif/fixed] FAPE over {_n_fr} frame(s) x {_n_sc} sidechain atom(s)")
-        elif motif_fixed_active and motif_slide_active:
-            print(f"[motif/fixed] FAPE DISABLED (sliding mode active; "
-                  f"per-epoch frame rebuild not implemented in v1)")
+            print(f"[motif] FAPE over {_n_fr} frame(s) ({_F_fix} fixed + {_F_slide} "
+                  f"sliding) x {_n_sc} scored atom(s) ({_S_fix} fixed sc + "
+                  f"{_n_lig_fape} ligand + {_S_slide} sliding sc)")
         if motif_slide_active:
             _slide_chains = sorted({r['chain'] for isl in slide_islands for r in isl})
             print(f"[motif/slide] {len(slide_islands)} island(s), {M_slide} "
                   f"residues from chain(s) {','.join(_slide_chains)}; "
                   f"island_lengths={slide_island_lengths}; "
-                  f"init state={slide_state}; T schedule "
-                  f"{motif_slide_T_init} -> {motif_slide_T_final} over "
-                  f"{slide_runtime['total_calls']} calls; "
-                  f"steps/call={motif_slide_steps_per_epoch}; "
-                  f"swap_prob={motif_slide_swap_prob}, "
-                  f"shift_max={motif_slide_shift_max}; "
-                  f"fix_seq={bool(fix_motif_seq)} (pin moves with state)")
+                  f"init state={slide_state}; method={motif_slide_method}; "
+                  f"determinant={motif_slide_loss}")
+            if motif_slide_method == 'mcmc':
+                print(f"[motif/slide] MCMC T schedule "
+                      f"{motif_slide_T_init} -> {motif_slide_T_final} over "
+                      f"{slide_runtime['total_calls']} calls; "
+                      f"steps/call={motif_slide_steps_per_epoch}; "
+                      f"swap_prob={motif_slide_swap_prob}, "
+                      f"shift_max={motif_slide_shift_max}; "
+                      + ("" if motif_slide_loss == 'distogram' else
+                         "(coords determinant -> placement updates on full-mode "
+                         "epochs only); ")
+                      + f"fix_seq={bool(fix_motif_seq)} (pin moves with state)")
+            else:
+                print(f"[motif/slide] exhaustive triplet enumeration; "
+                      f"determinant={motif_slide_loss}; beta 2 -> 20 over "
+                      f"{slide_runtime['total_calls']} calls; "
+                      + ("" if motif_slide_loss == 'distogram' else
+                         "(coords determinant -> placement updates on full-mode "
+                         "epochs only); ")
+                      + f"fix_seq={bool(fix_motif_seq)} (pin moves with state)")
 
     # ---- Explicit atom-pair distance restraints (--atom_pairs) -------------
     # Resolved once here (binder length fixed -> stable target indices); the
@@ -2422,6 +1642,16 @@ def boltz_hallucination(
         for _s in atom_pair_specs:
             print(f"  {_s['label']}  tok({_s['tok_a']},{_s['tok_b']}) "
                   f"atom({_s['atom_a']},{_s['atom_b']})")
+
+    # ---- Explicit three-atom angle restraints (--atom_angles) ---------------
+    # Coords-only (no distogram variant); resolved once here like --atom_pairs.
+    atom_angles_active = bool(atom_angles)
+    atom_angle_specs = None
+    if atom_angles_active:
+        atom_angle_specs = resolve_atom_angles(atom_angles, batch, structure)
+        print(f"[atom_angles] {len(atom_angle_specs)} angle restraint(s):")
+        for _s in atom_angle_specs:
+            print(f"  {_s['label']}  atom({_s['atom_a']},{_s['atom_b']},{_s['atom_c']})")
 
     # ---- COM loss sources --------------------------------------------------
     # Parse ORI HETATMs from --pdb_path (anchor = all non-binder atoms in the
@@ -2532,9 +1762,11 @@ def boltz_hallucination(
         prev_sequence=""
         # Per-target lists (inter_chain_cutoff_pt, num_inter_contacts_pt,
         # optimize_contact_per_binder_pos_pt, mask_target_prerun_pt, i_con_w,
-        # i_pae_w, tplddt_w, target_masks, target_chain_ids) are captured from
-        # the enclosing boltz_hallucination scope; get_model_loss reads them
-        # directly so the long arg list doesn't need to thread per-target lists.
+        # i_pae_w, tplddt_w, target_masks, i_con_target_masks, i_pae_target_masks,
+        # inter_target_con_pair_masks, inter_target_pae_pair_masks,
+        # target_chain_ids) are captured from the enclosing boltz_hallucination
+        # scope; get_model_loss reads them directly so the long arg list doesn't
+        # need to thread per-target lists.
         def get_model_loss(batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run=False, distogram_only=False, predict_args=None, loss_scales=None, binder_chain='A', increasing_contact_over_itr=False, num_intra_contacts=4,  num_optimizing_binder_pos =1, intra_chain_cutoff=14.0, save_trajectory=False, epoch_idx=0, stage_name='unknown'):
             traj_coords = None
             traj_plddt = None
@@ -2564,6 +1796,8 @@ def boltz_hallucination(
                 'run_confidence_sequentially': True,
                 'disconnect_feats': disconnect_feats,
                 'disconnect_pairformer': disconnect_pairformer,
+                'disconnect_feats_structure': disconnect_feats_structure,
+                'disconnect_pairformer_structure': disconnect_pairformer_structure,
                 'disconnect_coords': not attach_coords,
             }
 
@@ -2634,7 +1868,12 @@ def boltz_hallucination(
                 w = i_con_w[ti]
                 if w == 0:
                     continue
-                t_mask = target_masks[ti]
+                # Epitope targeting: the target SIDE of the contact term uses the
+                # i_con residue-restricted mask (full chain if this target was not
+                # named in --i_con_target_residues). It is mask_1d in the standard
+                # (per-target-residue) branch and mask_1b in the per-binder-pos
+                # branch, so a single substitution covers both.
+                t_mask = i_con_target_masks[ti]
                 if optimize_contact_per_binder_pos_pt[ti]:
                     # Per-binder-position contact objective (count from the binder
                     # side: mask_1d=chain_mask). num_pos selects how many binder
@@ -2669,6 +1908,22 @@ def boltz_hallucination(
             if i_con_any:
                 losses['i_con_loss'] = i_con_loss
 
+            # Auxiliary INTER-TARGET contact loss: optimize contacts BETWEEN two
+            # target chains. Each pair reuses the exact get_con_loss term as the
+            # binder<->target i_con (the two target-residue selections are
+            # mask_1d / mask_1b); pair losses are summed. Like con_loss/i_con it
+            # is a distogram loss, so it is computed in pre_run and full mode. The
+            # overall weight is loss_scales['inter_target_con_loss'].
+            if inter_target_con_pair_masks:
+                it_con_loss = pdist.new_zeros(())
+                for _mA, _mB, _desc in inter_target_con_pair_masks:
+                    it_con_loss = it_con_loss + get_con_loss(
+                        pdist, mid_pts,
+                        num=inter_target_num_contacts, seqsep=0,
+                        cutoff=inter_target_cutoff, binary=False,
+                        mask_1d=_mA, mask_1b=_mB)
+                losses['inter_target_con_loss'] = it_con_loss
+
             if not pre_run and not distogram_only:
                 plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask)
                 pae = (dict_out['pae'] + dict_out['pae'].transpose(-2,-1))/2
@@ -2685,7 +1940,12 @@ def boltz_hallucination(
                     w = i_pae_w[ti]
                     if w == 0:
                         continue
-                    li = get_pae_loss(pae, mask_1d=target_masks[ti], mask_1b=chain_mask)
+                    # Epitope targeting: restrict the target rows entering the
+                    # inter-chain PAE to the i_pae selection (full chain if this
+                    # target was not named in --i_pae_target_residues). pae is
+                    # symmetrized just above, so restricting mask_1d alone already
+                    # covers both directions of the selected-target<->binder block.
+                    li = get_pae_loss(pae, mask_1d=i_pae_target_masks[ti], mask_1b=chain_mask)
                     i_pae_loss = i_pae_loss + w * li
                     i_pae_any = True
 
@@ -2696,6 +1956,20 @@ def boltz_hallucination(
                 })
                 if i_pae_any:
                     losses['i_pae_loss'] = i_pae_loss
+
+                # Auxiliary INTER-TARGET interface-PAE loss: same get_pae_loss
+                # term as the binder<->target i_pae, between two target-residue
+                # selections (mask_1d / mask_1b). pae is symmetrized above, so a
+                # single call per pair captures both directions of the
+                # sideA<->sideB block; pair losses are summed. Full-mode only
+                # (pae is unavailable in pre_run / distogram_only), matching
+                # i_pae. Weight: loss_scales['inter_target_pae_loss'].
+                if inter_target_pae_pair_masks:
+                    it_pae_loss = pdist.new_zeros(())
+                    for _mA, _mB, _desc in inter_target_pae_pair_masks:
+                        it_pae_loss = it_pae_loss + get_pae_loss(
+                            pae, mask_1d=_mA, mask_1b=_mB)
+                    losses['inter_target_pae_loss'] = it_pae_loss
 
                 # COM loss: binder centroid pulled toward Kabsch-transformed
                 # ORI atoms parsed from --pdb_path / --motif_pdb. Full-mode
@@ -2733,16 +2007,24 @@ def boltz_hallucination(
                 pae_history.append(pae[0].detach().cpu().numpy())
 
             # Motif scaffolding supervised losses (ColabDesign `partial`).
-            #   - `motif_distogram_loss`: bin-center MSE on the trunk distogram
-            #     restricted to motif token pairs (fast-mode safe).
+            #   - `motif_distogram_loss`: trunk-distogram restraint over motif
+            #     token pairs (fast-mode safe); one-hot categorical CE by default
+            #     (--motif_distogram_loss_type), or bin-center MSE.
             #   - `motif_coords_loss`:    Kabsch (backbone-only) + RMSD over
             #     backbone (and ligand if --motif_ligand_residues set), full-
             #     mode only; gradient needs --attach_coords True like rg_loss.
             #   - `motif_fape_loss`:      AF-style frame-aligned sidechain
             #     error (full-mode only; same gating).
             if motif_active:
+                # Update the sliding-island placement (MCMC or exhaustive) BEFORE
+                # the supervised terms, so they (and the token/atom index tensors)
+                # see the freshly-chosen placement. No-op for fixed-only motifs or
+                # when the determinant is unavailable this epoch.
+                if motif_slide_active:
+                    _run_slide_placement(dict_out, pdist, mid_pts)
                 losses['motif_distogram_loss'] = get_motif_distogram_loss(
-                    pdist, motif_token_idx, motif_target_dist, mid_pts)
+                    pdist, motif_token_idx, motif_target_dist, mid_pts,
+                    method=motif_distogram_loss_type)
                 if (not pre_run and not distogram_only
                         and 'sample_atom_coords' in dict_out):
                     _mloss, _mstats = get_motif_coords_loss(
@@ -2792,6 +2074,20 @@ def boltz_hallucination(
                         loss_component_history.setdefault(f"atom_pair|cdist|{_lab}", []).append(_st['dist'])
                         loss_component_history.setdefault(f"atom_pair|closs|{_lab}", []).append(_st['loss'])
 
+            # Explicit three-atom angle restraints (--atom_angles). Coords-only
+            # (an angle is undefined on the trunk distogram): needs the sampler
+            # (full mode) and carries a gradient only with --attach_coords True.
+            if (atom_angles_active and not pre_run and not distogram_only
+                    and 'sample_atom_coords' in dict_out):
+                aa_coords_loss, aa_coords_stats = get_atom_angle_coords_loss(
+                    dict_out['sample_atom_coords'], atom_angle_specs,
+                    return_stats=True)
+                losses['atom_angle_coords_loss'] = aa_coords_loss
+                for _st in aa_coords_stats:
+                    _lab = _st['label']
+                    loss_component_history.setdefault(f"atom_angle|cang|{_lab}", []).append(_st['angle'])
+                    loss_component_history.setdefault(f"atom_angle|closs|{_lab}", []).append(_st['loss'])
+
             bins = mid_points < 8.0
             px = torch.sum(torch.softmax(dict_out['pdistogram'], dim=-1)[:,:,:,bins], dim=-1)
 
@@ -2803,20 +2099,25 @@ def boltz_hallucination(
                     'plddt_loss': 0.1,
                     'pae_loss': 0.4,
                     'i_pae_loss': 0.1,
+                    'inter_target_con_loss': 1.0,
+                    'inter_target_pae_loss': 0.1,
                     'rg_loss': 0.3,
                     'target_plddt_loss': 0.1,
-                    'motif_distogram_loss': 1.0,
-                    'motif_coords_loss': 1.0,
-                    'motif_fape_loss': 1.0,
+                    'motif_distogram_loss': 0.0,
+                    'motif_coords_loss': 0.0,
+                    'motif_fape_loss': 0.0,
                     'atom_pair_distogram_loss': 1.0,
                     'atom_pair_coords_loss': 1.0,
+                    'atom_angle_coords_loss': 1.0,
                 }
 
             # Defensive: these keys may be present in `losses` while a
             # caller-supplied loss_scales (configs/CLI) predates the feature.
             for _k in ('target_plddt_loss', 'motif_distogram_loss', 'motif_coords_loss',
                        'motif_fape_loss',
-                       'atom_pair_distogram_loss', 'atom_pair_coords_loss', 'com_loss'):
+                       'atom_pair_distogram_loss', 'atom_pair_coords_loss',
+                       'atom_angle_coords_loss', 'com_loss',
+                       'inter_target_con_loss', 'inter_target_pae_loss'):
                 if _k in losses and _k not in loss_scales:
                     loss_scales = {**loss_scales, _k: 1.0}
 
@@ -2868,6 +2169,11 @@ def boltz_hallucination(
             if motif_active and fix_motif_seq:
                 batch['res_type'] = (batch['res_type'] * (1 - motif_row_mask)
                                      + motif_res_type_full)
+                # Record the placement the pin was just applied at. The MCMC/
+                # exhaustive move happens later in get_model_loss, so this is the
+                # state the FINAL sequence is pinned to (the mapping uses it).
+                if motif_slide_active:
+                    _last_pin_slide_state[0] = list(slide_state)
 
             if non_protein_target:
                 batch['msa'] = batch['res_type'].unsqueeze(0).to(device).detach()
@@ -3015,30 +2321,6 @@ def boltz_hallucination(
         torch.cuda.empty_cache()
         return output
 
-    def visualize_results(plots):
-        # Plot distogram predictions
-        if plots:
-            num_plots = len(plots)
-            num_rows = (num_plots + 5) // 6
-            fig, axs = plt.subplots(num_rows, 6, figsize=(15, num_rows * 2.5))
-            
-            if num_rows == 1:
-                axs = axs.reshape(1, -1)
-
-            for i, plot_data in enumerate(plots):
-                row, col = i // 6, i % 6
-                axs[row, col].imshow(plot_data)
-                axs[row, col].set_title(f'Epoch {i + 1}')
-                axs[row, col].axis('off')
-
-            # Hide unused subplots
-            for j in range(num_plots, num_rows * 6):
-                axs[j // 6, j % 6].axis('off')
-
-            plt.tight_layout()
-            plt.show()
-            plots.clear()
-
     # visualize_results(plots)
 
     if pre_run:
@@ -3048,6 +2330,25 @@ def boltz_hallucination(
         best_seq = ''.join([alphabet[i] for i in torch.argmax(batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
         data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = best_seq
         return batch['res_type'].detach().cpu().numpy(), plots, loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list
+
+    # Motif residue -> FINAL binder position mapping (the design loop is done, so
+    # slide_state is final). Keys: original motif residue (chain+resnum in the
+    # motif PDB); values: binder chain + 1-indexed residue. Covers --motif_residues
+    # (fixed) and --motif_unindex_residues (sliding) alike. The caller writes JSON.
+    if motif_active and motif_mapping_out is not None:
+        if motif_fixed_active:
+            for _k, (_mc, _mr) in enumerate(m_chain_residues):
+                motif_mapping_out[f"{_mc}{_mr}"] = f"{binder_chain}{binder_pos[_k] + 1}"
+        if motif_slide_active:
+            # Use the slide_state the sequence was actually pinned at (the in-loop
+            # pin precedes the final MCMC/exhaustive move), so the mapping matches
+            # the folded binder. Falls back to the current state when fix_motif_seq
+            # is off (no pin -> the geometry placement is the only truth).
+            _map_state = (_last_pin_slide_state[0]
+                          if _last_pin_slide_state[0] is not None else slide_state)
+            _final_pos = _placement_to_positions(_map_state, slide_islands)
+            for _k, (_mc, _mr) in enumerate(slide_chain_residues):
+                motif_mapping_out[f"{_mc}{_mr}"] = f"{binder_chain}{_final_pos[_k] + 1}"
 
     boltz_model.eval()
 
@@ -3067,8 +2368,26 @@ def boltz_hallucination(
     final_sampler = SamplerConfig(write_full_pae=True)
     final_predict_args = apply_sampler_config(boltz_model, final_sampler)
 
+    # Binder positions occupied by the pinned motif (final, pin-consistent state).
+    # Semi-greedy accepts mutations on iPTM alone -- it never sees the motif loss
+    # -- so without this guard it could silently mutate a pinned motif residue.
+    _motif_binder_pos_arr = None
+    if motif_active and fix_motif_seq:
+        _mbp = list(binder_pos) if motif_fixed_active else []
+        if motif_slide_active:
+            _mstate = (_last_pin_slide_state[0]
+                       if _last_pin_slide_state[0] is not None else slide_state)
+            _mbp += list(_placement_to_positions(_mstate, slide_islands))
+        _motif_binder_pos_arr = np.array(sorted(set(_mbp)), dtype=int)
+
     def _mutate(sequence, best_logits, i_prob):
         mutated_sequence = list(sequence) # Create a copy of the input tensor
+        i_prob = np.array(i_prob, dtype=float)
+        if _motif_binder_pos_arr is not None and _motif_binder_pos_arr.size:
+            i_prob[_motif_binder_pos_arr] = 0.0   # never mutate pinned motif residues
+            if i_prob.sum() <= 0:                 # degenerate: spread over the rest
+                i_prob = np.ones(length, dtype=float)
+                i_prob[_motif_binder_pos_arr] = 0.0
         i = np.random.choice(np.arange(length),p=i_prob/i_prob.sum())
         i_logits = best_logits[:, i]
         i_logits = i_logits - torch.max(i_logits)
@@ -3153,6 +2472,32 @@ def boltz_hallucination(
         finally:
             data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = _saved_data_seq
 
+    # Standardized final-fold metrics (holo + apo). Computed below from the LAST
+    # successful 200-step fold; stays None if the fold failed (early returns).
+    final_metrics = None
+
+    def _compute_final_metrics(out_holo, bb_holo, bs_holo, out_apo, bb_apo, bs_apo):
+        """Best-effort holo+apo metrics from the final fold; never raises."""
+        result = {}
+        try:
+            if out_holo is not None:
+                result['holo'] = compute_final_metrics(
+                    boltz_model, out_holo, bb_holo, bs_holo,
+                    binder_chain=binder_chain,
+                    target_chain_ids=list(target_chain_ids or []), length=length,
+                    atom_pairs=atom_pairs, atom_angles=atom_angles,
+                    com_loss_weight=com_loss_weight, pdb_path=pdb_path,
+                    metric_config=metric_config)
+            if out_apo is not None:
+                result['apo'] = compute_final_metrics(
+                    boltz_model, out_apo, bb_apo, bs_apo,
+                    binder_chain=binder_chain, target_chain_ids=[], length=length,
+                    atom_pairs=None, atom_angles=None, com_loss_weight=0.0,
+                    pdb_path='', metric_config=metric_config)
+        except Exception as e:
+            print(f"[metrics] compute_final_metrics failed: {type(e).__name__}: {e}")
+        return result or None
+
     # final_predict_args / final_sampler were installed above (stock defaults);
     # all folds from here on -- the seed fold, the semi-greedy per-mutation evals
     # and the post-semi-greedy fold -- use them.
@@ -3165,7 +2510,7 @@ def boltz_hallucination(
     if output is None or output_apo is None:
         print("[boltz_hallucination] final-fold output unavailable; skipping "
               "semi-greedy and returning collected histories for plotting.")
-        return output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo, distogram_history, sequence_history, loss_history, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list, traj_plddt_list, structure, loss_component_history, plddt_history, pae_history
+        return output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo, distogram_history, sequence_history, loss_history, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list, traj_plddt_list, structure, loss_component_history, plddt_history, pae_history, final_metrics
 
     prev_sequence = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
     prev_iptm = output['iptm'].detach().cpu().numpy()
@@ -3185,7 +2530,7 @@ def boltz_hallucination(
             if output is None:
                 print(f"[semi-greedy] step {step} epoch {t}: fold failed; "
                       f"aborting semi-greedy with histories collected.")
-                return output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo, distogram_history, sequence_history, loss_history, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list, traj_plddt_list, structure, loss_component_history, plddt_history, pae_history
+                return output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo, distogram_history, sequence_history, loss_history, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list, traj_plddt_list, structure, loss_component_history, plddt_history, pae_history, final_metrics
 
             iptm = output['iptm'].detach().cpu().numpy()
             confidence_score.append(iptm)
@@ -3228,7 +2573,11 @@ def boltz_hallucination(
                 _dump_pdb_to_intermediate(
                     "semi_greedy_last.pdb", _coords, _plddt, best_structure)
 
-    return output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo, distogram_history, sequence_history, loss_history, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list, traj_plddt_list, structure, loss_component_history, plddt_history, pae_history
+    final_metrics = _compute_final_metrics(
+        output, best_batch, best_structure,
+        output_apo, best_batch_apo, best_structure_apo)
+
+    return output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo, distogram_history, sequence_history, loss_history, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list, traj_plddt_list, structure, loss_component_history, plddt_history, pae_history, final_metrics
 
 
 def run_boltz_design(
@@ -3246,6 +2595,7 @@ def run_boltz_design(
     save_trajectory=False,
     save_intermediate_structures=False,
     redo_boltz_predict=True,
+    metric_config=None,
 ):
     """
     Run Boltz protein design pipeline.
@@ -3280,6 +2630,8 @@ def run_boltz_design(
             'use_temp': True,
             'disconnect_feats': True,
             'disconnect_pairformer': False,
+            'disconnect_feats_structure': True,
+            'disconnect_pairformer_structure': False,
             'distogram_only': True,
             'binder_chain': 'A',
             'non_protein_target': False,
@@ -3290,6 +2642,12 @@ def run_boltz_design(
             'i_pae_loss_weights': (0.1,),
             'target_plddt_loss_weights': (0.0,),
             'target_chain_ids': None,
+            'i_con_target_residues': None,
+            'i_pae_target_residues': None,
+            'inter_target_con_pairs': [],
+            'inter_target_pae_pairs': [],
+            'inter_target_num_contacts': 2,
+            'inter_target_cutoff': 14.0,
             'pdb_path': '',
             'com_loss_weight': 0.0,
             'pocket_conditioning': False,
@@ -3315,12 +2673,15 @@ def run_boltz_design(
     loss_dir = os.path.join(version_dir, 'loss')
     animation_save_dir = os.path.join(version_dir, 'animation')
     fasta_dir = os.path.join(version_dir, 'fasta')
+    # Motif residue -> final binder position maps (one JSON per design), written
+    # whenever a motif is active (--motif_residues and/or --motif_unindex_residues).
+    motif_mapping_dir = os.path.join(version_dir, 'motif_mapping')
     # Always create the intermediate_structures root: it holds the always-on
     # {stage}_last.pdb / semi_greedy_last.pdb dumps regardless of
     # save_intermediate_structures (which only gates per-epoch dumps).
     intermediate_structures_root = os.path.join(version_dir, 'intermediate_structures')
 
-    _dirs_to_make = [results_yaml_dir, results_final_dir, results_yaml_dir_apo, results_final_dir_apo, loss_dir, animation_save_dir, fasta_dir]
+    _dirs_to_make = [results_yaml_dir, results_final_dir, results_yaml_dir_apo, results_final_dir_apo, loss_dir, animation_save_dir, fasta_dir, motif_mapping_dir]
     if intermediate_structures_root is not None:
         _dirs_to_make.append(intermediate_structures_root)
     for directory in _dirs_to_make:
@@ -3369,7 +2730,10 @@ def run_boltz_design(
                         intermediate_dir=intermediate_dir_itr,
                     )
                     print('warm up done')
-                    output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo ,distogram_history_2, sequence_history_2, loss_history_2, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list_2, traj_plddt_list_2, structure, loss_component_history, plddt_history, pae_history = boltz_hallucination(
+                    # Receives the motif residue -> final binder position mapping
+                    # (fixed + sliding); written to JSON below when non-empty.
+                    _motif_map = {}
+                    output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo ,distogram_history_2, sequence_history_2, loss_history_2, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list_2, traj_plddt_list_2, structure, loss_component_history, plddt_history, pae_history, final_metrics = boltz_hallucination(
                         boltz_model,
                         yaml_path,
                         ccd_lib,
@@ -3381,6 +2745,8 @@ def run_boltz_design(
                         save_trajectory=save_trajectory,
                         save_intermediate_structures=save_intermediate_structures,
                         intermediate_dir=intermediate_dir_itr,
+                        metric_config=metric_config,
+                        motif_mapping_out=_motif_map,
                     )
                     loss_history.extend(loss_history_2)
                     distogram_history.extend(distogram_history_2) 
@@ -3442,22 +2808,7 @@ def run_boltz_design(
                     # run are plotted. Each subplot has its OWN y-axis (no
                     # sharing) so widely-different magnitudes coexist cleanly.
                     try:
-                        plt.style.use('dark_background')
-                        fig, ax = plt.subplots(1, 1, figsize=(5, 4))
-                        fig.patch.set_facecolor('#1C1C1C')
-                        ax.plot(loss_component_history.get('total_loss', loss_history),
-                                color='#00ff99', linewidth=2)
-                        ax.set_xlabel('Logged Steps', fontsize=12)
-                        ax.set_ylabel('Total Loss', fontsize=12)
-                        ax.set_title('Total Loss History', fontsize=14, pad=15)
-                        ax.grid(True, linestyle='--', alpha=0.3)
-                        plt.tight_layout(pad=3.0)
-                        if loss_dir:
-                            plt.savefig(
-                                os.path.join(loss_dir, f'{target_binder_input}_loss_history_itr{itr + 1}_length{config["length"]}.png'),
-                                facecolor='#1C1C1C', edgecolor='none', bbox_inches='tight', dpi=300)
-                        plt.show()
-                        plt.close(fig)
+                        plot_total_loss_history(loss_component_history, loss_history, loss_dir, save_filename=f"{target_binder_input}_total_loss_history_itr{itr + 1}_length{config['length']}.png")
 
                         distogram_ani, sequence_ani, plddt_ani, pae_ani = visualize_training_history(best_batch,loss_history, sequence_history, distogram_history, config["length"], binder_chain =config['binder_chain'], save_dir=animation_save_dir, save_filename=f"{target_binder_input}_itr{itr + 1}_length{config['length']}", plddt_history=plddt_history, pae_history=pae_history)
                         if show_animation:
@@ -3471,13 +2822,13 @@ def run_boltz_design(
                         print(f"Error plotting total-loss history: {str(e)}")
                         continue
 
-                    # Total-loss CSV (also captures con/icon for compatibility).
+                    # Total-loss CSV. total_loss only -- the contact losses are
+                    # written to the distogram-category CSV as con_loss/i_con_loss
+                    # (no longer aliased here as intra/inter_contact_loss).
                     try:
                         if loss_dir:
                             main_series = {
                                 'total_loss': loss_component_history.get('total_loss', loss_history),
-                                'intra_contact_loss': con_loss_history,
-                                'inter_contact_loss': i_con_loss_history,
                             }
                             main_csv = os.path.join(
                                 loss_dir,
@@ -3500,19 +2851,30 @@ def run_boltz_design(
                     # Three category figures: distogram / confidence / coords.
                     # Each has its own png + csv, atom_pair distogram column
                     # carries the method suffix so downstream tools can group it.
+                    # The atom-pair per-pair distance diagnostics (+ shaded target
+                    # window) are overlaid on a twin axis of the Atom-Pair *Loss
+                    # subplots via `augment`, so no separate atom-pair figure is
+                    # needed.
                     try:
-                        _apd_method = config.get("atom_pair_distogram_loss_type", "expected")
+                        _apd_method = config.get("atom_pair_distogram_loss_type", "cross_entropy")
                         _overrides_dist = {
                             'atom_pair_distogram_loss': f'atom_pair_distogram_loss_{_apd_method}',
                         }
+                        _ap_aug_dist, _ap_aug_coords = _atom_pair_subplot_augments(
+                            loss_component_history)
+                        _aa_aug_coords = _atom_angle_subplot_augments(
+                            loss_component_history)
                         _suffix = f'_itr{itr + 1}_length{config["length"]}'
-                        for _gname, _specs, _title, _overrides in [
+                        for _gname, _specs, _title, _overrides, _augment in [
                             ('distogram',  _LOSS_GROUPS['distogram'],
-                             'Distogram Losses', _overrides_dist),
+                             'Distogram Losses', _overrides_dist,
+                             {'atom_pair_distogram_loss': _ap_aug_dist}),
                             ('confidence', _LOSS_GROUPS['confidence'],
-                             'Confidence Losses', None),
+                             'Confidence Losses', None, None),
                             ('coords',     _LOSS_GROUPS['coords'],
-                             'Coordinate Losses', None),
+                             'Coordinate Losses', None,
+                             {'atom_pair_coords_loss': _ap_aug_coords,
+                              'atom_angle_coords_loss': _aa_aug_coords}),
                         ]:
                             if not loss_dir:
                                 break
@@ -3525,25 +2887,26 @@ def run_boltz_design(
                             wrote = _plot_loss_group(
                                 loss_component_history, _specs,
                                 _png, _csv, _title,
-                                csv_col_overrides=_overrides)
+                                csv_col_overrides=_overrides, augment=_augment)
                             if wrote:
                                 print(f"[loss] {_gname} loss history -> {_csv}")
                     except Exception as e:
                         print(f"Error plotting category loss histories: {str(e)}")
 
-                    # ---- Atom-pair distance restraint diagnostics (--atom_pairs)
-                    # Plot the per-pair distance the distogram loss optimizes
-                    # (expected distance E[d]; argmax-bin "mode"; and, in full
-                    # mode, the coord distance) plus the per-pair loss vs. logged
-                    # step, and dump a CSV -- both into the animation folder so
-                    # the restraint can be debugged. Own try/except (warn only).
+                    # ---- Atom-pair per-pair diagnostics CSV (--atom_pairs) -----
+                    # The per-pair distance/window curves are overlaid on the
+                    # Atom-Pair *Loss subplots of the category figures above (see
+                    # `augment`); here we just dump the full per-pair table
+                    # (distance, target window, loss for the distogram restraint
+                    # and, in full mode, the coord restraint) into the loss folder.
+                    # Own try/except (warn only).
                     try:
                         import re as _re
                         ap_keys = [k for k in loss_component_history
                                    if k.startswith('atom_pair|dist|')]
-                        if ap_keys:
+                        if ap_keys and loss_dir:
                             labels = [k.split('atom_pair|dist|', 1)[1] for k in ap_keys]
-                            _apd_method = config.get("atom_pair_distogram_loss_type", "expected")
+                            _apd_method = config.get("atom_pair_distogram_loss_type", "cross_entropy")
 
                             def _win(lab):
                                 m = _re.search(r'\[([-\d.]+),\s*([-\d.]+)\]A\s*$', lab)
@@ -3552,52 +2915,9 @@ def run_boltz_design(
                             def _h(kind, lab):
                                 return loss_component_history.get(f'atom_pair|{kind}|{lab}', [])
 
-                            plt.style.use('dark_background')
-                            fig, (axd, axl) = plt.subplots(1, 2, figsize=(13, 4.5))
-                            fig.patch.set_facecolor('#1C1C1C')
-                            cmap = plt.get_cmap('tab10')
-                            for i, lab in enumerate(labels):
-                                c = cmap(i % 10)
-                                short = lab.split(' [')[0]
-                                axd.plot(_h('dist', lab), color=c, linewidth=2,
-                                         label=f'{short}  E[d]')
-                                mode = _h('mode', lab)
-                                if mode:
-                                    axd.plot(mode, color=c, linewidth=1, linestyle=':',
-                                             alpha=0.7, label=f'{short}  mode')
-                                cdist = _h('cdist', lab)
-                                if cdist:
-                                    axd.plot(cdist, color=c, linewidth=1.6, linestyle='--',
-                                             label=f'{short}  coord d')
-                                lo, hi = _win(lab)
-                                if lo is not None:
-                                    axd.axhspan(lo, hi, color=c, alpha=0.12)
-                                axl.plot(_h('loss', lab), color=c, linewidth=2, label=short)
-                            axd.set_xlabel('Logged Steps', fontsize=12)
-                            axd.set_ylabel('Atom-pair distance (A)', fontsize=12)
-                            axd.set_title('Atom-pair distance (shaded = target window)',
-                                          fontsize=13, pad=12)
-                            axd.grid(True, linestyle='--', alpha=0.3)
-                            axd.legend(fontsize=7, loc='best')
-                            axl.set_xlabel('Logged Steps', fontsize=12)
-                            axl.set_ylabel('Atom-pair distogram loss', fontsize=12)
-                            axl.set_title(f'Atom-pair distogram loss ({_apd_method})',
-                                          fontsize=13, pad=12)
-                            axl.grid(True, linestyle='--', alpha=0.3)
-                            axl.legend(fontsize=7, loc='best')
-                            plt.tight_layout(pad=2.5)
-                            os.makedirs(animation_save_dir, exist_ok=True)
-                            ap_png = os.path.join(
-                                animation_save_dir,
-                                f'{target_binder_input}_atom_pair_itr{itr + 1}_length{config["length"]}.png')
-                            fig.savefig(ap_png, facecolor='#1C1C1C', edgecolor='none',
-                                        bbox_inches='tight', dpi=200)
-                            plt.show()
-                            plt.close(fig)
-
                             # CSV: one row per (logged step, pair) with everything.
                             ap_csv = os.path.join(
-                                animation_save_dir,
+                                loss_dir,
                                 f'{target_binder_input}_atom_pair_itr{itr + 1}_length{config["length"]}.csv')
                             with open(ap_csv, 'w', newline='') as f:
                                 w = csv.writer(f)
@@ -3616,9 +2936,47 @@ def run_boltz_design(
                                         w.writerow([t, short, lo, hi, g(dist, t),
                                                     g(mode, t), g(pwin, t), g(dloss, t),
                                                     g(cdist, t), g(closs, t)])
-                            print(f"[atom_pairs] distance/loss diagnostics -> {ap_png} , {ap_csv}")
+                            print(f"[atom_pairs] per-pair diagnostics -> {ap_csv}")
                     except Exception as e:
-                        print(f"Error plotting atom-pair diagnostics: {str(e)}")
+                        print(f"Error writing atom-pair diagnostics CSV: {str(e)}")
+
+                    # ---- Atom-angle per-angle diagnostics CSV (--atom_angles) --
+                    # The per-angle trace is overlaid on the Atom-Angle Coords
+                    # Loss subplot of the coords category figure (see `augment`);
+                    # here we dump the full per-angle table (angle, target window,
+                    # loss) into the loss folder. Coords-only, so the columns are
+                    # the full-mode angle + violation. Own try/except (warn only).
+                    try:
+                        import re as _re
+                        aa_keys = [k for k in loss_component_history
+                                   if k.startswith('atom_angle|cang|')]
+                        if aa_keys and loss_dir:
+                            labels = [k.split('atom_angle|cang|', 1)[1] for k in aa_keys]
+
+                            def _winA(lab):
+                                m = _re.search(r'\[([-\d.]+),\s*([-\d.]+)\]deg\s*$', lab)
+                                return (float(m.group(1)), float(m.group(2))) if m else (None, None)
+
+                            def _hA(kind, lab):
+                                return loss_component_history.get(f'atom_angle|{kind}|{lab}', [])
+
+                            aa_csv = os.path.join(
+                                loss_dir,
+                                f'{target_binder_input}_atom_angle_itr{itr + 1}_length{config["length"]}.csv')
+                            with open(aa_csv, 'w', newline='') as f:
+                                w = csv.writer(f)
+                                w.writerow(['step', 'angle_spec', 'lo', 'hi',
+                                            'angle_deg', 'coord_loss'])
+                                for lab in labels:
+                                    lo, hi = _winA(lab)
+                                    short = lab.split(' [')[0]
+                                    ang = _hA('cang', lab); closs = _hA('closs', lab)
+                                    for t in range(len(ang)):
+                                        g = lambda s, j: (f'{s[j]:.4f}' if j < len(s) else '')
+                                        w.writerow([t, short, lo, hi, g(ang, t), g(closs, t)])
+                            print(f"[atom_angles] per-angle diagnostics -> {aa_csv}")
+                    except Exception as e:
+                        print(f"Error writing atom-angle diagnostics CSV: {str(e)}")
 
                     # ---- Motif scaffolding loss diagnostics (--motif_*) --------
                     # Plot the supervised motif losses vs. logged step and dump a
@@ -3709,6 +3067,16 @@ def run_boltz_design(
                             ff.write(best_sequence[i:i+60] + "\n")
                     print(f"Wrote FASTA: {fasta_path}")
 
+                    # Motif residue -> final binder position map (one JSON per
+                    # design), e.g. {"A30": "A27", ...}. Written whenever a motif
+                    # is active (fixed --motif_residues and/or sliding
+                    # --motif_unindex_residues); empty dict => no motif, skip.
+                    if _motif_map:
+                        motif_map_path = os.path.join(motif_mapping_dir, f"{fasta_tag}.json")
+                        with open(motif_map_path, 'w') as mf:
+                            json.dump(_motif_map, mf, indent=2)
+                        print(f"Wrote motif mapping: {motif_map_path}")
+
 
                     shutil.copy2(yaml_path, result_yaml)
                     with open(result_yaml, 'r') as f:
@@ -3743,5 +3111,16 @@ def run_boltz_design(
                     else:
                         print("[run_boltz_design] skipping save_confidence_scores: "
                               "final-fold output missing.")
+
+                    # Standardized cross-run metrics from the final 200-step fold
+                    # (holo + apo), written next to the confidence JSON. Independent
+                    # of redo_boltz_predict: final_metrics came from the in-memory
+                    # 200-step validation fold inside boltz_hallucination.
+                    if final_metrics:
+                        _mname = f"{target_binder_input}_results_itr{itr + 1}_length{config['length']}"
+                        if final_metrics.get('holo') is not None:
+                            print(f"[metrics] wrote {save_metrics_json(results_final_dir, final_metrics['holo'], _mname, 0)}")
+                        if final_metrics.get('apo') is not None:
+                            save_metrics_json(results_final_dir_apo, final_metrics['apo'], _mname, 0)
                     gc.collect()
                     torch.cuda.empty_cache()
