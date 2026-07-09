@@ -2,6 +2,8 @@ binder_chain: A
 design_algorithm: 3stages
 disconnect_feats: true
 disconnect_pairformer: false
+disconnect_feats_structure: true
+disconnect_pairformer_structure: false
 distogram_only: true
 e_soft: 0.8
 e_soft_1: 0.8
