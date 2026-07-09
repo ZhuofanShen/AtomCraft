@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Bar plots of final-step losses per design iteration.
 
-BoltzDesign1 writes, per design iteration, into ``<output>/loss/``:
-  * ``<input>_aux_loss_history_itr<N>_length<L>.csv`` -- ``step`` +
-    helix/plddt/pae/rg/target_plddt + (when --atom_pairs is set) the atom-pair
-    aggregates. The atom-pair distogram column is named
-    ``atom_pair_distogram_loss_<method>`` (method = prob|expected|contact),
-    which fixes its unit and hence how it is grouped below.
-  * ``<input>_motif_loss_itr<N>_length<L>.csv`` -- motif_distogram_loss /
-    motif_coords_loss (when --motif_pdb is set).
-  * ``<input>_loss_history_itr<N>_length<L>.csv`` -- total/intra/inter contact.
+BoltzDesign1 writes, per design iteration, into ``<output>/loss/`` (one figure +
+matching CSV per category; only loss series with data this run are emitted):
+  * ``<input>_distogram_loss_history_itr<N>_length<L>.csv`` -- con_loss,
+    i_con_loss, helix_loss, motif_distogram_loss, atom_pair_distogram_loss
+    (trunk-distogram losses). When --atom_pairs is set the atom-pair distogram
+    column is named ``atom_pair_distogram_loss_<method>`` (method =
+    prob|expected|contact), which fixes its unit and hence how it is grouped.
+  * ``<input>_confidence_loss_history_itr<N>_length<L>.csv`` -- plddt_loss,
+    pae_loss, i_pae_loss, target_plddt_loss (confidence head, full mode only).
+  * ``<input>_coords_loss_history_itr<N>_length<L>.csv`` -- rg_loss, com_loss,
+    motif_coords_loss, motif_bb_rmsd, motif_lig_rmsd, motif_fape_loss,
+    atom_pair_coords_loss (sample-coords losses, in Angstrom).
+  * ``<input>_loss_history_itr<N>_length<L>.csv`` -- total_loss only (the contact
+    losses are in the distogram CSV above as con_loss / i_con_loss).
 
 Takes the last logged step of every iteration (the converged loss for that
 design) and writes, into ``<output>/final_loss_plots/`` (a sibling of ``loss/``):
@@ -18,12 +23,13 @@ design) and writes, into ``<output>/final_loss_plots/`` (a sibling of ``loss/``)
     overlaid point, +/-1 std error bars):
       1. plddt_loss, target_plddt_loss
       2. pae_loss, i_pae_loss
-      3a (Angstrom): rg_loss, motif_coords_loss, sqrt(motif_distogram_loss)
-         (bin-center MSE -> A), sqrt(atom_pair_coords_loss), and
-         sqrt(atom_pair_distogram_loss) when its method is 'expected'
-      3b (dimensionless / cross-entropy): helix_loss and atom_pair_distogram_loss
-         when its method is 'prob'/'contact'
-      4. total_loss, intra_contact_loss, inter_contact_loss
+      3 (contact / distogram): con_loss, i_con_loss,
+         helix_loss, motif_distogram_loss, atom_pair_distogram_loss. NB the last
+         two are bin-center MSE in A^2 (or nats for prob/contact atom-pair
+         methods), so this group mixes units with the dimensionless contact CEs.
+      4 (Angstrom): rg_loss, motif_coords_loss, motif_fape_loss,
+         atom_pair_coords_loss
+      5. total_loss (the summed objective, on its own)
   * ``final_losses_by_itr.csv`` / ``main_losses_by_itr.csv`` (the plotted data).
 
 Usage:
@@ -33,7 +39,6 @@ Usage:
 import argparse
 import csv
 import glob
-import math
 import os
 import random
 import re
@@ -43,22 +48,26 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-AUX_GLOB = "*_aux_loss_history_itr*_length*.csv"
-MAIN_GLOB = "*_loss_history_itr*_length*.csv"      # also matches aux; filtered below
-MOTIF_GLOB = "*_motif_loss_itr*_length*.csv"
+# Per-category loss CSVs (the current BoltzDesign1 layout).
+DISTOGRAM_GLOB = "*_distogram_loss_history_itr*_length*.csv"
+CONFIDENCE_GLOB = "*_confidence_loss_history_itr*_length*.csv"
+COORDS_GLOB = "*_coords_loss_history_itr*_length*.csv"
+# Total/intra/inter contact. NOTE: this glob also matches the three category
+# CSVs above (they all end in ``_loss_history_itr...``); the category infixes
+# are excluded when collecting the main file (see CATEGORY_INFIXES).
+MAIN_GLOB = "*_loss_history_itr*_length*.csv"
+CATEGORY_INFIXES = ("_distogram_loss_history_", "_confidence_loss_history_",
+                    "_coords_loss_history_")
 ITR_RE = re.compile(r"_itr(\d+)_length(\d+)\.csv$")
 
 IDENT = lambda v: v
-SQRT = lambda v: math.sqrt(v) if v >= 0 else float("nan")  # squared losses are >=0
 
 
 def find_loss_dir(path):
     """Accept either an output run folder or its loss/ folder directly."""
     cand = os.path.join(path, "loss")
     for d in (cand, path):
-        if (glob.glob(os.path.join(d, AUX_GLOB))
-                or glob.glob(os.path.join(d, MAIN_GLOB))
-                or glob.glob(os.path.join(d, MOTIF_GLOB))):
+        if glob.glob(os.path.join(d, MAIN_GLOB)):
             return d
     raise SystemExit(f"No loss CSVs found under {path!r} or {cand!r}")
 
@@ -90,12 +99,16 @@ def read_final_losses(csv_path):
     return finals
 
 
-def collect(loss_dir, glob_pat, exclude_aux=False):
-    """itr -> {column: final value} over CSVs matching glob_pat (+ category order)."""
+def collect(loss_dir, glob_pat, exclude_infixes=()):
+    """itr -> {column: final value} over CSVs matching glob_pat (+ category order).
+
+    exclude_infixes: skip files whose basename contains any of these substrings
+    (used to keep the broad MAIN_GLOB from also picking up the category CSVs).
+    """
     per_itr, categories = {}, []
     for path in glob.glob(os.path.join(loss_dir, glob_pat)):
         base = os.path.basename(path)
-        if exclude_aux and "_aux_loss_history_" in base:
+        if any(s in base for s in exclude_infixes):
             continue
         m = ITR_RE.search(base)
         if not m:
@@ -220,66 +233,76 @@ def main():
     for _stale in glob.glob(os.path.join(out_dir, "mean_*.png")):
         os.remove(_stale)
 
-    aux_per_itr, aux_cats = collect(loss_dir, AUX_GLOB)
-    motif_per_itr, motif_cats = collect(loss_dir, MOTIF_GLOB)
-    main_per_itr, main_cats = collect(loss_dir, MAIN_GLOB, exclude_aux=True)
-    if not (aux_per_itr or motif_per_itr or main_per_itr):
+    disto_per_itr, disto_cats = collect(loss_dir, DISTOGRAM_GLOB)
+    conf_per_itr, conf_cats = collect(loss_dir, CONFIDENCE_GLOB)
+    coords_per_itr, coords_cats = collect(loss_dir, COORDS_GLOB)
+    main_per_itr, main_cats = collect(loss_dir, MAIN_GLOB,
+                                      exclude_infixes=CATEGORY_INFIXES)
+    if not (disto_per_itr or conf_per_itr or coords_per_itr or main_per_itr):
         raise SystemExit(f"No parseable loss CSVs in {loss_dir!r}")
 
-    # Components 1-4 come from aux + motif (merged per itr).
-    comp_per_itr = merge_per_itr(aux_per_itr, motif_per_itr)
-    comp_cats = aux_cats + [c for c in motif_cats if c not in aux_cats]
+    # Components 1-3 come from the distogram/confidence/coords category CSVs
+    # (merged per itr); motif_* and atom_pair_* columns ride along inside them.
+    comp_per_itr = merge_per_itr(disto_per_itr, conf_per_itr, coords_per_itr)
+    comp_cats = []
+    for cats in (disto_cats, conf_cats, coords_cats):
+        comp_cats += [c for c in cats if c not in comp_cats]
 
     if comp_per_itr:
         write_summary(comp_per_itr, comp_cats,
                       os.path.join(out_dir, "final_losses_by_itr.csv"))
         plot_per_itr(comp_per_itr, comp_cats, out_dir)
+    if main_per_itr:
+        write_summary(main_per_itr, main_cats,
+                      os.path.join(out_dir, "main_losses_by_itr.csv"))
 
-        apd_key, apd_method = find_apd(comp_cats)
+    # Grouped mean bars. group_3's contacts/helix/atom-pair-distogram come from
+    # the category CSVs and group_5's total_loss from the main loss-history CSV,
+    # so merge both per-itr maps before plotting (column names are disjoint, so
+    # no clobbering).
+    mean_per_itr = merge_per_itr(comp_per_itr, main_per_itr)
+    if mean_per_itr:
+        apd_key, _apd_method = find_apd(comp_cats)  # method no longer affects grouping
 
-        # 1-2: same-unit aux groups.
-        plot_mean_bar(comp_per_itr,
+        # 1-2: same-unit confidence groups.
+        plot_mean_bar(mean_per_itr,
                       [("plddt_loss", "plddt_loss", IDENT),
                        ("target_plddt_loss", "target_plddt_loss", IDENT)],
                       "pLDDT losses", os.path.join(out_dir, "mean_1_plddt.png"))
-        plot_mean_bar(comp_per_itr,
+        plot_mean_bar(mean_per_itr,
                       [("pae_loss", "pae_loss", IDENT),
                        ("i_pae_loss", "i_pae_loss", IDENT)],
                       "PAE losses", os.path.join(out_dir, "mean_2_pae.png"))
 
-        # 3a: linear-Angstrom losses (squared ones are sqrt'd to A).
-        # motif_distogram_loss is bin-center MSE (A^2), so it joins this group
-        # after a sqrt -> A.
-        group_a = [("rg_loss", "rg_loss", IDENT),
+        # 3: contact + distogram losses (all trunk-distogram terms). helix is
+        # the i->i+3 distogram contact CE; motif_distogram and atom_pair_distogram
+        # are added raw (bin-center MSE in A^2, or nats for prob/contact
+        # atom-pair methods), so this group mixes units with the dimensionless
+        # contact CEs.
+        group_3 = [("con_loss", "con_loss", IDENT),
+                   ("i_con_loss", "i_con_loss", IDENT),
+                   ("helix_loss", "helix_loss", IDENT),
+                   ("motif_distogram_loss", "motif_distogram_loss", IDENT)]
+        if apd_key:
+            group_3.append((apd_key, apd_key, IDENT))
+        plot_mean_bar(mean_per_itr, group_3,
+                      "Contact & distogram losses (contacts / helix / motif & atom-pair distogram)",
+                      os.path.join(out_dir, "mean_3_contact.png"))
+
+        # 4: linear-Angstrom sample-coords losses (all already in A: RMSD-form
+        # rg / motif / FAPE and the RMS-violation atom-pair restraint).
+        group_4 = [("rg_loss", "rg_loss", IDENT),
                    ("motif_coords_loss", "motif_coords_loss", IDENT),
-                   ("motif_distogram_loss", "sqrt(motif_distogram_loss)", SQRT),
                    ("motif_fape_loss", "motif_fape_loss", IDENT),
-                   ("atom_pair_coords_loss", "sqrt(atom_pair_coords_loss)", SQRT)]
-        if apd_key and apd_method == "expected":
-            group_a.append((apd_key, f"sqrt({apd_key})", SQRT))
-        plot_mean_bar(comp_per_itr, group_a,
-                      "Angstrom-scale losses (rg / RMSD / sqrt squared-violations)",
-                      os.path.join(out_dir, "mean_3a_angstrom.png"))
+                   ("atom_pair_coords_loss", "atom_pair_coords_loss", IDENT)]
+        plot_mean_bar(mean_per_itr, group_4,
+                      "Angstrom-scale losses (rg / RMSD / atom-pair RMS violation)",
+                      os.path.join(out_dir, "mean_4_angstrom.png"))
 
-        # 3b: dimensionless cross-entropy / -log losses (helix is the i->i+3
-        # distogram contact CE).
-        group_b = [("helix_loss", "helix_loss", IDENT)]
-        if apd_key and apd_method in ("prob", "contact"):
-            group_b.append((apd_key, apd_key, IDENT))
-        plot_mean_bar(comp_per_itr, group_b,
-                      "Dimensionless distogram/contact losses (cross-entropy / -log)",
-                      os.path.join(out_dir, "mean_3b_dimensionless.png"))
-
-    # 5: total & contact losses from the main loss-history CSV.
-    if main_per_itr:
-        write_summary(main_per_itr, main_cats,
-                      os.path.join(out_dir, "main_losses_by_itr.csv"))
-        plot_mean_bar(main_per_itr,
-                      [("total_loss", "total_loss", IDENT),
-                       ("intra_contact_loss", "intra_contact_loss", IDENT),
-                       ("inter_contact_loss", "inter_contact_loss", IDENT)],
-                      "Total & contact losses",
-                      os.path.join(out_dir, "mean_4_total_contact.png"))
+        # 5: the summed objective, on its own.
+        plot_mean_bar(mean_per_itr,
+                      [("total_loss", "total_loss", IDENT)],
+                      "Total loss", os.path.join(out_dir, "mean_5_total.png"))
 
 
 if __name__ == "__main__":
