@@ -1,4 +1,5 @@
-# BoltzDesign1 🧬
+# BoltzDesign with Coordinates-Based Losses Enabled by Back-Propagating through a 2-Step ODE Sampler 🧬
+<img width="3933" height="1936" alt="图片1" src="https://github.com/user-attachments/assets/ce9b754c-4d5a-435f-930b-630a7cffb9ff" />
 
 **BoltzDesign1** is a molecular design tool powered by the Boltz model for designing protein-protein interactions and biomolecular complexes.
 
