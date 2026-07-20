@@ -1,10 +1,13 @@
-# BoltzDesign with Coordinates-Based Losses Enabled by Back-Propagating through a 2-Step ODE Sampler 🧬
+# AtomCraft: All-Atom Protein Hallucination via Back-Propagation through Reconfigured Few-Step ODE Sampler of Boltz 🧬
 <img width="3933" height="1936" alt="图片1" src="https://github.com/user-attachments/assets/ce9b754c-4d5a-435f-930b-630a7cffb9ff" />
 
-**BoltzDesign1** is a molecular design tool powered by the Boltz model for designing protein-protein interactions and biomolecular complexes.
+**AtomCraft** is a fork of BoltzDesign1 for de novo protein hallucination with all-atom losses, back-propagated through Boltz's diffusion sampler reconfigured as a few-step ODE sampler. Beyond distogram-based backbone-level contact and confidence objectives, AtomCraft optimizes Kabsch-aligned coordinate losses over full-atom motifs, including active-site residues with bound ligands, cofactors, and metals.
 
-> 📄 **Paper**: [BoltzDesign1: AI-Powered Molecular Design](https://www.biorxiv.org/content/10.1101/2025.04.06.647261v1)  
-> 🚀 **Colab**: https://colab.research.google.com/github/yehlincho/BoltzDesign1/blob/main/Boltzdesign1.ipynb
+<img width="1776" height="835" alt="image" src="https://github.com/user-attachments/assets/1928cdfc-1fa1-4031-873a-bb0f2599baa6" />
+
+<img width="1606" height="928" alt="image" src="https://github.com/user-attachments/assets/ca61ea20-ac95-44c0-bf70-af9a380fc14f" />
+
+> 📄 **Original BoltzDesign1 Paper**: [BoltzDesign1: AI-Powered Molecular Design](https://www.biorxiv.org/content/10.1101/2025.04.06.647261v1)  
 
 ---
 
@@ -13,8 +16,8 @@
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yehlincho/BoltzDesign1.git
-   cd BoltzDesign1
+   git clone https://github.com/ZhuofanShen/AtomCraft.git
+   cd AtomCraft
    ```
 
 2. **Run the automated setup**
@@ -43,7 +46,9 @@ Run the complete pipeline from BoltzDesign to LigandMPNN/ProteinMPNN redesign an
 Examle for small molecule:
 python boltzdesign.py --target_name 7v11 --target_type small_molecule --target_mols OQO --gpu_id 0 --design_samples 2 --suffix 1
 
-Example for motif scaffolding via back-propagating through the structure-based RMSD/FAPE losses and Rg losses:
+Examples for motif scaffolding via back-propagating through the structure-based RMSD losses and Rg losses:
+
+```bash
 python boltzdesign.py \
     --target_name HEME \
     --pdb_path peroxidase_pos1-rot1.pdb \
@@ -55,33 +60,35 @@ python boltzdesign.py \
     --attach_coords True --rg_loss 0.3 \
     --target_plddt_loss 0.1 \
     --motif_pdb peroxidase_pos1-rot1.pdb \
-    --motif_unindex_residues A38:N,CA,C,O,CB 3 A42:N,CA,C,O,CB A170:N,CA,C,O,CB \
+    --motif_residues A38:N,CA,C,O,CB 3 A42:N,CA,C,O,CB A170:N,CA,C,O,CB \
+    --motif_binder_positions 38 42 120 \
     --motif_ligand_residues "B201:ALL" \
     --fix_motif_seq True --motif_coords_loss 0.3 \
-    --motif_slide_method exhaustive --motif_slide_loss rmsd \
     --design_samples 50 \
-    --suffix coords_10det_rg03_motif-exhaustive-coords-03 \
-    --gpu_id 6
+    --suffix coords_10det_rg03_motif-coords-03 \
+    --gpu_id 0
+```
 
-
+```bash
 python boltzdesign.py \
-    --target_name HEME \
-    --pdb_path peroxidase_pos1-rot1.pdb \
-    --target_types small_molecule \
-    --target_mols HEM \
-    --num_inter_contacts 3 --num_intra_contacts 2 \
+    --target_name Nd \
+    --pdb_path EFhand.pdb \
+    --target_types metal \
+    --target_mols ND \
+    --num_inter_contacts 6 --num_intra_contacts 2 \
     --distogram_only False --deterministic_sampler True \
     --use_heun False --sampling_steps 10 --step_scale 1.0 \
     --attach_coords True --rg_loss 0.3 \
     --target_plddt_loss 0.1 \
-    --motif_pdb peroxidase_pos1-rot1.pdb \
-    --motif_unindex_residues A38:N,CA,C,O,CB 3 A42:N,CA,C,O,CB A170:N,CA,C,O,CB \
-    --motif_ligand_residues "B201:ALL" \
-    --fix_motif_seq True --motif_fape_loss 0.3 \
-    --motif_slide_method exhaustive --motif_slide_loss fape \
+    --motif_pdb EFhand.pdb \
+    --motif_residues A59-70 \
+    --motif_binder_positions 59 60 61 62 63 64 65 66 67 68 69 70 \
+    --motif_ligand_residues "C202:ALL" \
+    --fix_motif_seq True --motif_coords_loss 0.3 \
     --design_samples 50 \
-    --suffix coords_10det_rg03_motif-exhaustive-fape-03 \
-    --gpu_id 7
+    --suffix coords_10det_rg03_indexed-motif-coords-03 \
+    --gpu_id 0
+```
 
 Example for DNA/RNA PDB design:
 python boltzdesign.py --target_name 5zmc --target_type dna --pdb_target_ids C,D --gpu_id 0 --design_samples 5 --suffix 1
