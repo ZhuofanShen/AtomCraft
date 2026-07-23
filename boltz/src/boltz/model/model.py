@@ -320,6 +320,8 @@ class Boltz1(LightningModule):
         run_confidence_sequentially: bool = False,
         disconnect_feats: bool = False,
         disconnect_pairformer: bool = False,
+        disconnect_feats_structure: bool = True,
+        disconnect_pairformer_structure: bool = False,
         disconnect_coords: bool = True,
     ) -> dict[str, Tensor]:
         dict_out = {}
@@ -369,11 +371,32 @@ class Boltz1(LightningModule):
             dict_out = {"pdistogram": pdistogram}
 
     
+        # Structure-module (diffusion sampler) gradient control.
+        # The sampler is conditioned on s_inputs (= input_embedder(feats), a
+        # shallow trunk-bypassing route from res_type) AND on the 48-layer
+        # Pairformer trunk outputs s_trunk/z_trunk. With the sampler run under
+        # grad (attach_coords=True, i.e. disconnect_coords=False) a coordinate
+        # gradient (rg/com/motif coords) can reach the binder sequence through
+        # either route. These two flags gate those two routes INDEPENDENTLY of
+        # the confidence-head flags below (disconnect_feats/disconnect_pairformer):
+        #   * disconnect_feats_structure -> detach s_inputs into the sampler,
+        #     killing the trunk-bypassing s_inputs shortcut while leaving the
+        #     through-trunk s_trunk/z_trunk gradient intact.
+        #   * disconnect_pairformer_structure -> detach s_trunk/z_trunk into the
+        #     sampler, killing the through-trunk route.
+        # Both no-ops unless the sampler runs under grad; the trunk's own use of
+        # s_inputs above is untouched. (The confidence head separately re-embeds
+        # s_inputs from feats in the loaded imitate_trunk model, so its s_inputs
+        # route is gated by disconnect_feats, not by these flags.)
+        s_inputs_sampler = s_inputs.detach() if disconnect_feats_structure else s_inputs
+        s_sampler = s.detach() if disconnect_pairformer_structure else s
+        z_sampler = z.detach() if disconnect_pairformer_structure else z
+
         structure_out = self.structure_module.sample(
-            s_trunk=s,
-            z_trunk=z,
-            s_inputs=s_inputs,
-            feats=feats,
+            s_trunk=s_sampler,
+            z_trunk=z_sampler,
+            s_inputs=s_inputs_sampler,
+            feats=feats, # feats["res_type"] is not consumed
             relative_position_encoding=relative_position_encoding,
             num_sampling_steps=num_sampling_steps,
             atom_mask=feats["atom_pad_mask"],
@@ -399,6 +422,9 @@ class Boltz1(LightningModule):
             feats_ = feats
 
         if disconnect_pairformer:
+            # Not consumed. s_inputs is re-embedded inside the confidence module's forward. 
+            # Detach here to prevent any confusion about whether gradients can flow from the confidence head 
+            # back to the trunk through s_inputs (they can't, because of the re-embedding).
             s_inputs = s_inputs.detach()
             s = s.detach()
             z = z.detach()
@@ -413,7 +439,7 @@ class Boltz1(LightningModule):
         if self.confidence_prediction:
             dict_out.update(
                 self.confidence_module(
-                    s_inputs=s_inputs,  # Allow gradients
+                    s_inputs=s_inputs,  # Not consumed
                     s=s,  # Allow gradients
                     z=z,  # Allow gradients
                     s_diffusion=(
@@ -422,7 +448,7 @@ class Boltz1(LightningModule):
                         else None
                     ),
                     x_pred=dict_out["sample_atom_coords"],  # Detached above iff disconnect_coords=True
-                    feats=feats_,
+                    feats=feats_, # s_inputs is re-embedded from feats_["res_type"]
                     pred_distogram_logits=dict_out_pdistogram,
                     multiplicity=diffusion_samples,
                     run_sequentially=run_confidence_sequentially,
