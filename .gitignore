@@ -1,6 +1,6 @@
 # Python bytecode
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 
 # Build artifacts
@@ -8,19 +8,34 @@ __pycache__/
 build/
 dist/
 
+# Virtualenvs
+.venv/
+venv/
+
 # Pipeline working dirs
 inputs/
 outputs/
 outputs_*/
 
+# Logs
+*.log
+
 # LigandMPNN downloads / data
 LigandMPNN/model_params/
 LigandMPNN/wget-log
+
+# Model weights / large assets
+*.ckpt
+*.pt
 
 # Raw PDB / structure files at repo root
 /*.pdb
 /*.pdb.gz
 /*.cif
+
+# Local scratch
+scratch/
+tmp/
 
 # Editor / OS noise
 .ipynb_checkpoints/

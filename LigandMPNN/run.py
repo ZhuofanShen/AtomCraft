@@ -12,7 +12,6 @@ from prody import writePDB
 
 from data_utils import (
     alphabet,
-    element_dict_rev,
     featurize,
     get_score,
     get_seq_rec,
@@ -25,6 +24,7 @@ from model_utils import ProteinMPNN
 
 
 def main(args) -> None:
+    
     """
     Inference function
     """
@@ -169,7 +169,7 @@ def main(args) -> None:
             device=device,
             chains=args.parse_these_chains_only,
             parse_all_atoms=args.ligand_mpnn_use_side_chain_context,
-            parse_atoms_with_zero_occupancy=args.parse_atoms_with_zero_occupancy
+            parse_atoms_with_zero_occupancy=args.parse_atoms_with_zero_occupancy,
         )
         # make chain_letter + residue_idx + insertion_code mapping to integers
         R_idx_list = list(protein_dict["R_idx"].cpu().numpy())  # residue indices
@@ -258,7 +258,6 @@ def main(args) -> None:
             ),
             device=device,
         )
-
         # create chain_mask to notify which residues are fixed (0) and which need to be designed (1)
         if redesigned_residues:
             protein_dict["chain_mask"] = chain_mask * (1 - redesigned_positions)
@@ -384,189 +383,224 @@ def main(args) -> None:
             loss_list = []
             loss_per_residue_list = []
             loss_XY_list = []
-            for _ in range(args.number_of_batches):
-                feature_dict["randn"] = torch.randn(
-                    [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
-                    device=device,
-                )
-                
-                output_dict = model.sample(feature_dict)
-
-                # compute confidence scores
-                loss, loss_per_residue = get_score(
-                    output_dict["S"],
-                    output_dict["log_probs"],
-                    feature_dict["mask"] * feature_dict["chain_mask"],
-                )
-                if args.model_type == "ligand_mpnn":
-                    combined_mask = (
-                        feature_dict["mask"]
-                        * feature_dict["mask_XY"]
-                        * feature_dict["chain_mask"]
-                    )
-                    active_sites = feature_dict["mask_XY"].cpu().numpy()[0]
-                    print(active_sites)
-
-                    PDB_residues_active_sites = [
-                        encoded_residue_dict_rev[item]
-                        for item in range(len(active_sites))
-                        if active_sites[item] == 1]
-                
-                    print("active sites", list(np.where(active_sites == 1)[0]))
-                    print("PDB_residues_active_sites", PDB_residues_active_sites)
-                else:
-                    combined_mask = feature_dict["mask"] * feature_dict["chain_mask"]
-                loss_XY, _ = get_score(
-                    output_dict["S"], output_dict["log_probs"], combined_mask
-                )
-                # -----
-                S_list.append(output_dict["S"])
-                log_probs_list.append(output_dict["log_probs"])
-                sampling_probs_list.append(output_dict["sampling_probs"])
-                decoding_order_list.append(output_dict["decoding_order"])
-                loss_list.append(loss)
-                loss_per_residue_list.append(loss_per_residue)
-                loss_XY_list.append(loss_XY)
-            S_stack = torch.cat(S_list, 0)
-            log_probs_stack = torch.cat(log_probs_list, 0)
-            sampling_probs_stack = torch.cat(sampling_probs_list, 0)
-            decoding_order_stack = torch.cat(decoding_order_list, 0)
-            loss_stack = torch.cat(loss_list, 0)
-            loss_per_residue_stack = torch.cat(loss_per_residue_list, 0)
-            loss_XY_stack = torch.cat(loss_XY_list, 0)
-            rec_mask = feature_dict["mask"][:1] * feature_dict["chain_mask"][:1]
-            rec_stack = get_seq_rec(feature_dict["S"][:1], S_stack, rec_mask)
-
-            native_seq = "".join(
-                [restype_int_to_str[AA] for AA in feature_dict["S"][0].cpu().numpy()]
-            )
-            seq_np = np.array(list(native_seq))
-            seq_out_str = []
-            for mask in protein_dict["mask_c"]:
-                seq_out_str += list(seq_np[mask.cpu().numpy()])
-                seq_out_str += [args.fasta_seq_separation]
-            seq_out_str = "".join(seq_out_str)[:-1]
-
-            output_fasta = base_folder + "/seqs/" + name + args.file_ending + ".fa"
-            output_backbones = base_folder + "/backbones/"
-            output_stats_path = base_folder + "stats/" + name + args.file_ending + ".pt"
-
-            out_dict = {}
-            out_dict["generated_sequences"] = S_stack.cpu()
-            out_dict["sampling_probs"] = sampling_probs_stack.cpu()
-            out_dict["log_probs"] = log_probs_stack.cpu()
-            out_dict["decoding_order"] = decoding_order_stack.cpu()
-            out_dict["native_sequence"] = feature_dict["S"][0].cpu()
-            out_dict["mask"] = feature_dict["mask"][0].cpu()
-            out_dict["chain_mask"] = feature_dict["chain_mask"][0].cpu()
-            out_dict["seed"] = seed
-            out_dict["temperature"] = args.temperature
-            if args.save_stats:
-                torch.save(out_dict, output_stats_path)
-
-            with open(output_fasta, "w") as f:
-                f.write(
-                    ">{}, T={}, seed={}, num_res={}, num_ligand_res={}, use_ligand_context={}, ligand_cutoff_distance={}, batch_size={}, number_of_batches={}, model_path={}\n{}\n".format(
-                        name,
-                        args.temperature,
-                        seed,
-                        torch.sum(rec_mask).cpu().numpy(),
-                        torch.sum(combined_mask[:1]).cpu().numpy(),
-                        bool(args.ligand_mpnn_use_atom_context),
-                        float(args.ligand_mpnn_cutoff_for_score),
-                        args.batch_size,
-                        args.number_of_batches,
-                        checkpoint_path,
-                        seq_out_str,
-                    )
-                )
-                for ix in range(S_stack.shape[0]):
-                    ix_suffix = ix
-                    if not args.zero_indexed:
-                        ix_suffix += 1
-                    seq_rec_print = np.format_float_positional(
-                        rec_stack[ix].cpu().numpy(), unique=False, precision=4
-                    )
-                    loss_np = np.format_float_positional(
-                        np.exp(-loss_stack[ix].cpu().numpy()), unique=False, precision=4
-                    )
-                    loss_XY_np = np.format_float_positional(
-                        np.exp(-loss_XY_stack[ix].cpu().numpy()),
-                        unique=False,
-                        precision=4,
-                    )
-                    seq = "".join(
-                        [restype_int_to_str[AA] for AA in S_stack[ix].cpu().numpy()]
+            logits_list = []
+            if not hasattr(args, 'score') or args.score == False:
+                for _ in range(args.number_of_batches):
+                    feature_dict["randn"] = torch.randn(
+                        [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
+                        device=device,
                     )
 
-                    # write new sequences into PDB with backbone coordinates
-                    seq_prody = np.array([restype_1to3[AA] for AA in list(seq)])[
-                        None,
-                    ].repeat(4, 1)
-                    bfactor_prody = (
-                        loss_per_residue_stack[ix].cpu().numpy()[None, :].repeat(4, 1)
+                    output_dict = model.sample(feature_dict)
+
+                    # compute confidence scores
+                    loss, loss_per_residue = get_score(
+                        output_dict["S"],
+                        output_dict["log_probs"],
+                        feature_dict["mask"] * feature_dict["chain_mask"],
                     )
-                    backbone.setResnames(seq_prody)
-                    backbone.setBetas(
-                        np.exp(-bfactor_prody)
-                        * (bfactor_prody > 0.01).astype(np.float32)
-                    )
-                    if other_atoms:
-                        writePDB(
-                            output_backbones
-                            + name
-                            + "_"
-                            + str(ix_suffix)
-                            + args.file_ending
-                            + ".pdb",
-                            backbone + other_atoms,
+                    if args.model_type == "ligand_mpnn":
+                        combined_mask = (
+                            feature_dict["mask"]
+                            * feature_dict["mask_XY"]
+                            * feature_dict["chain_mask"]
                         )
+                        active_sites = feature_dict["mask_XY"].cpu().numpy()[0]
+                        print(active_sites)
+
+                        PDB_residues_active_sites = [
+                            encoded_residue_dict_rev[item]
+                            for item in range(len(active_sites))
+                            if active_sites[item] == 1
+                        ]
+
+                        print("active sites", list(np.where(active_sites == 1)[0]))
+                        print("PDB_residues_active_sites", PDB_residues_active_sites)
                     else:
-                        writePDB(
-                            output_backbones
-                            + name
-                            + "_"
-                            + str(ix_suffix)
-                            + args.file_ending
-                            + ".pdb",
-                            backbone,
+                        combined_mask = feature_dict["mask"] * feature_dict["chain_mask"]
+                    loss_XY, _ = get_score(
+                        output_dict["S"], output_dict["log_probs"], combined_mask
+                    )
+                    # -----
+                    S_list.append(output_dict["S"])
+                    log_probs_list.append(output_dict["log_probs"])
+                    sampling_probs_list.append(output_dict["sampling_probs"])
+                    decoding_order_list.append(output_dict["decoding_order"])
+                    loss_list.append(loss)
+                    loss_per_residue_list.append(loss_per_residue)
+                    loss_XY_list.append(loss_XY)
+                S_stack = torch.cat(S_list, 0)
+                log_probs_stack = torch.cat(log_probs_list, 0)
+                sampling_probs_stack = torch.cat(sampling_probs_list, 0)
+                decoding_order_stack = torch.cat(decoding_order_list, 0)
+                loss_stack = torch.cat(loss_list, 0)
+                loss_per_residue_stack = torch.cat(loss_per_residue_list, 0)
+                loss_XY_stack = torch.cat(loss_XY_list, 0)
+                rec_mask = feature_dict["mask"][:1] * feature_dict["chain_mask"][:1]
+                rec_stack = get_seq_rec(feature_dict["S"][:1], S_stack, rec_mask)
+
+                native_seq = "".join(
+                    [restype_int_to_str[AA] for AA in feature_dict["S"][0].cpu().numpy()]
+                )
+                seq_np = np.array(list(native_seq))
+                seq_out_str = []
+                for mask in protein_dict["mask_c"]:
+                    seq_out_str += list(seq_np[mask.cpu().numpy()])
+                    seq_out_str += [args.fasta_seq_separation]
+                seq_out_str = "".join(seq_out_str)[:-1]
+
+                output_fasta = base_folder + "/seqs/" + name + args.file_ending + ".fa"
+                output_backbones = base_folder + "/backbones/"
+                output_stats_path = base_folder + "stats/" + name + args.file_ending + ".pt"
+
+                out_dict = {}
+                out_dict["generated_sequences"] = S_stack.cpu()
+                out_dict["sampling_probs"] = sampling_probs_stack.cpu()
+                out_dict["log_probs"] = log_probs_stack.cpu()
+                out_dict["decoding_order"] = decoding_order_stack.cpu()
+                out_dict["native_sequence"] = feature_dict["S"][0].cpu()
+                out_dict["mask"] = feature_dict["mask"][0].cpu()
+                out_dict["chain_mask"] = feature_dict["chain_mask"][0].cpu()
+                out_dict["seed"] = seed
+                out_dict["temperature"] = args.temperature
+                
+                if hasattr(args, "return_logits") and args.return_logits:
+                    print("return logits")
+                    return out_dict
+
+                
+                # if hasattr(args, "return_logits") and args.return_logits:
+                #     # Ensure NO other output to stdout
+                #     json_out = {
+                #         "log_probs": out_dict["log_probs"].tolist(),
+                #         "S": out_dict["generated_sequences"].tolist(),
+                #     }
+                #     sys.exit(0)
+
+                if args.save_stats:
+                    torch.save(out_dict, output_stats_path)
+
+                with open(output_fasta, "w") as f:
+                    f.write(
+                        ">{}, T={}, seed={}, num_res={}, num_ligand_res={}, use_ligand_context={}, ligand_cutoff_distance={}, batch_size={}, number_of_batches={}, model_path={}\n{}\n".format(
+                            name,
+                            args.temperature,
+                            seed,
+                            torch.sum(rec_mask).cpu().numpy(),
+                            torch.sum(combined_mask[:1]).cpu().numpy(),
+                            bool(args.ligand_mpnn_use_atom_context),
+                            float(args.ligand_mpnn_cutoff_for_score),
+                            args.batch_size,
+                            args.number_of_batches,
+                            checkpoint_path,
+                            seq_out_str,
                         )
-                    # write fasta lines
-                    seq_np = np.array(list(seq))
-                    seq_out_str = []
-                    for mask in protein_dict["mask_c"]:
-                        seq_out_str += list(seq_np[mask.cpu().numpy()])
-                        seq_out_str += [args.fasta_seq_separation]
-                    seq_out_str = "".join(seq_out_str)[:-1]
-                    if ix == S_stack.shape[0] - 1:
-                        # final 2 lines
-                        f.write(
-                            ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}".format(
-                                name,
-                                ix_suffix,
-                                args.temperature,
-                                seed,
-                                loss_np,
-                                loss_XY_np,
-                                seq_rec_print,
-                                seq_out_str,
-                            )
+                    )
+                    for ix in range(S_stack.shape[0]):
+                        ix_suffix = ix
+                        if not args.zero_indexed:
+                            ix_suffix += 1
+                        seq_rec_print = np.format_float_positional(
+                            rec_stack[ix].cpu().numpy(), unique=False, precision=4
                         )
-                    else:
-                        f.write(
-                            ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}\n".format(
-                                name,
-                                ix_suffix,
-                                args.temperature,
-                                seed,
-                                loss_np,
-                                loss_XY_np,
-                                seq_rec_print,
-                                seq_out_str,
-                            )
+                        loss_np = np.format_float_positional(
+                            np.exp(-loss_stack[ix].cpu().numpy()), unique=False, precision=4
+                        )
+                        loss_XY_np = np.format_float_positional(
+                            np.exp(-loss_XY_stack[ix].cpu().numpy()),
+                            unique=False,
+                            precision=4,
+                        )
+                        seq = "".join(
+                            [restype_int_to_str[AA] for AA in S_stack[ix].cpu().numpy()]
                         )
 
+                        # write new sequences into PDB with backbone coordinates
+                        seq_prody = np.array([restype_1to3[AA] for AA in list(seq)])[
+                            None,
+                        ].repeat(4, 1)
+                        bfactor_prody = (
+                            loss_per_residue_stack[ix].cpu().numpy()[None, :].repeat(4, 1)
+                        )
+                        backbone.setResnames(seq_prody)
+                        backbone.setBetas(
+                            np.exp(-bfactor_prody)
+                            * (bfactor_prody > 0.01).astype(np.float32)
+                        )
+                        if other_atoms:
+                            writePDB(
+                                output_backbones
+                                + name
+                                + "_"
+                                + str(ix_suffix)
+                                + args.file_ending
+                                + ".pdb",
+                                backbone + other_atoms,
+                            )
+                        else:
+                            writePDB(
+                                output_backbones
+                                + name
+                                + "_"
+                                + str(ix_suffix)
+                                + args.file_ending
+                                + ".pdb",
+                                backbone,
+                            )
+                        # write fasta lines
+                        seq_np = np.array(list(seq))
+                        seq_out_str = []
+                        for mask in protein_dict["mask_c"]:
+                            seq_out_str += list(seq_np[mask.cpu().numpy()])
+                            seq_out_str += [args.fasta_seq_separation]
+                        seq_out_str = "".join(seq_out_str)[:-1]
+                        if ix == S_stack.shape[0] - 1:
+                            # final 2 lines
+                            f.write(
+                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}".format(
+                                    name,
+                                    ix_suffix,
+                                    args.temperature,
+                                    seed,
+                                    loss_np,
+                                    loss_XY_np,
+                                    seq_rec_print,
+                                    seq_out_str,
+                                )
+                            )
+                        else:
+                            f.write(
+                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}\n".format(
+                                    name,
+                                    ix_suffix,
+                                    args.temperature,
+                                    seed,
+                                    loss_np,
+                                    loss_XY_np,
+                                    seq_rec_print,
+                                    seq_out_str,
+                                )
+                            )
+            else:
+                for _ in range(args.number_of_batches):
+                    if hasattr(args, "replace_seq"):
+                        feature_dict["S"] = args.replace_seq.to(feature_dict["S"].device)
+                    feature_dict["randn"] = torch.randn(
+                        [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
+                        device=device,
+                    )
+                    output_dict = model.conditional_score(feature_dict, use_sequence=True)
+                    log_probs_list.append(output_dict["log_probs"])
+                    logits_list.append(output_dict["logits"])
+                log_probs_stack = torch.cat(log_probs_list, 0)
+                logits_stack = torch.cat(logits_list, 0)
 
+                out_dict = {}
+                out_dict["log_probs"] = log_probs_stack.cpu()
+                out_dict["logits"] = logits_stack.cpu()
+                return out_dict
+
+                        
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -595,14 +629,14 @@ if __name__ == "__main__":
         default="./model_params/ligandmpnn_v_32_010_25.pt",
         help="Path to model weights.",
     )
-    
+
     argparser.add_argument(
         "--checkpoint_Cas9_mpnn",
         type=str,
         default="./model_params/Cas9mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
-    
+
     argparser.add_argument(
         "--checkpoint_Luc7_mpnn",
         type=str,
@@ -730,6 +764,12 @@ if __name__ == "__main__":
     )
 
     argparser.add_argument(
+        "--return_logits",
+        action='store_true',
+        help="Return logits instead of sequences.",
+    )
+
+    argparser.add_argument(
         "--out_folder",
         type=str,
         help="Path to a folder to output sequences, e.g. /home/out/",
@@ -828,6 +868,13 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="To parse atoms with zero occupancy in the PDB input files. 0 - do not parse, 1 - parse atoms with zero occupancy",
+    )
+
+    argparser.add_argument(
+        "--gpu_id",
+        type=int,
+        default=0,
+        help="GPU id to use.",
     )
 
     args = argparser.parse_args()
