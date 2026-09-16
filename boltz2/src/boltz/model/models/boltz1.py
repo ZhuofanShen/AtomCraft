@@ -350,6 +350,9 @@ class Boltz1(LightningModule):
         run_confidence_sequentially: bool = False,
         disconnect_feats: bool = False, 
         disconnect_pairformer: bool = False,
+        disconnect_feats_structure: bool = True,
+        disconnect_pairformer_structure: bool = False,
+        disconnect_coords: bool = True,
     ) -> dict[str, Tensor]:
         feats["target_pair_mask"] = None ## remove this 
         with torch.set_grad_enabled(True):
@@ -415,12 +418,22 @@ class Boltz1(LightningModule):
             }
 
 
+        # Structure-module (diffusion sampler) gradient control. The sampler is
+        # conditioned on s_inputs (a shallow, trunk-bypassing route from
+        # res_type) AND on the Pairformer trunk outputs s/z. With the sampler
+        # run under grad (attach_coords=True, i.e. disconnect_coords=False) a
+        # coordinate gradient can reach the binder sequence through either
+        # route; these two flags gate them independently.
+        s_inputs_sampler = s_inputs.detach() if disconnect_feats_structure else s_inputs
+        s_sampler = s.detach() if disconnect_pairformer_structure else s
+        z_sampler = z.detach() if disconnect_pairformer_structure else z
+
         dict_out.update(
             self.structure_module.sample(
-                s_trunk=s,
-                z_trunk=z,
-                s_inputs=s_inputs,
-                feats=feats,
+                s_trunk=s_sampler,
+                z_trunk=z_sampler,
+                s_inputs=s_inputs_sampler,
+                feats=feats,  # feats["res_type"] is not consumed
                 relative_position_encoding=relative_position_encoding,
                 num_sampling_steps=num_sampling_steps,
                 atom_mask=feats["atom_pad_mask"],
@@ -461,7 +474,14 @@ class Boltz1(LightningModule):
                         if self.confidence_module.use_s_diffusion
                         else None
                     ),
-                    x_pred=dict_out["sample_atom_coords"].detach(),
+                    # Detached unless disconnect_coords=False, which (with
+                    # attach_coords=True on AtomDiffusion) lets a coordinate
+                    # gradient flow back through the sampler.
+                    x_pred=(
+                        dict_out["sample_atom_coords"].detach()
+                        if disconnect_coords
+                        else dict_out["sample_atom_coords"]
+                    ),
                     feats=feats_,
                     pred_distogram_logits=dict_out["pdistogram"].detach(),
                     multiplicity=diffusion_samples,

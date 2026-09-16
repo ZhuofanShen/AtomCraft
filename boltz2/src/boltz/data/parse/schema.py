@@ -192,7 +192,7 @@ def convert_atom_name(name: str) -> tuple[int, int, int, int]:
 
     """
     name = name.strip()
-    name = [ord(c) - 32 for c in name]
+    name = [ord(c) - 32 for c in name][:4]            # truncate >4-char names
     name = name + [0] * (4 - len(name))
     return tuple(name)
 
@@ -1243,11 +1243,21 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             mol = AllChem.MolFromSmiles(seq)
             mol = AllChem.AddHs(mol)
 
-            # Set atom names
+            # Set atom names. Use a per-element counter (PDB convention) so
+            # names stay <=4 chars for typical ligands; the global
+            # canonical-rank scheme produced names like "H100" for ligands
+            # with >99 atoms of one element, blowing past the Atom dtype's
+            # 4-char name slot. Canonical order is preserved within each
+            # element. Upstream's length guard is kept as a backstop.
             canonical_order = AllChem.CanonicalRankAtoms(mol)
             Chem.AssignStereochemistry(mol, force=True, cleanIt=True)
-            for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
-                atom_name = atom.GetSymbol().upper() + str(can_idx + 1)
+            atoms_with_rank = sorted(
+                zip(mol.GetAtoms(), canonical_order), key=lambda x: x[1])
+            element_counts = {}
+            for atom, _ in atoms_with_rank:
+                sym = atom.GetSymbol().upper()
+                element_counts[sym] = element_counts.get(sym, 0) + 1
+                atom_name = f"{sym}{element_counts[sym]}"
                 if len(atom_name) > 4:
                     msg = (
                         f"{seq} has an atom with a name longer than "

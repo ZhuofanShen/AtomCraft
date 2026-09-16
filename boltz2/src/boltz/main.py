@@ -123,6 +123,8 @@ class BoltzDiffusionParams:
     alignment_reverse_diff: bool = True
     synchronize_sigmas: bool = True
     use_inference_model_cache: bool = True
+    use_heun: bool = False
+    deterministic_sampler: bool = False
 
 
 @dataclass
@@ -887,6 +889,32 @@ def cli() -> None:
     default=None,
 )
 @click.option(
+    "--gamma_0",
+    type=float,
+    help="EDM churn level (Boltz-1 sampler only). Set to 0.0 to turn the "
+    "sampler into a noise-free ODE sampler (pairs with --step_scale 1.0 for "
+    "stable few-step inference). If not provided, the model default is used.",
+    default=None,
+)
+@click.option(
+    "--use_heun",
+    type=bool,
+    is_flag=True,
+    help="Use Heun's second-order corrector in the diffusion sampler "
+    "(Boltz-1 sampler only). Doubles NFE per step but improves trajectory "
+    "accuracy. Default is False.",
+)
+@click.option(
+    "--deterministic_sampler",
+    type=bool,
+    is_flag=True,
+    help="Make the reverse diffusion sampler deterministic (Boltz-1 sampler "
+    "only): disable per-step random augmentation (keep centering), skip the "
+    "Kabsch/SVD alignment, and zero the EDM churn noise. Lowers structural "
+    "fidelity but gives a smooth, SVD-free sequence->coords map for "
+    "backprop. Default is False.",
+)
+@click.option(
     "--write_full_pae",
     type=bool,
     is_flag=True,
@@ -1054,6 +1082,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     diffusion_samples_affinity: int = 3,
     max_parallel_samples: Optional[int] = None,
     step_scale: Optional[float] = None,
+    gamma_0: Optional[float] = None,
+    use_heun: bool = False,
+    deterministic_sampler: bool = False,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1235,6 +1266,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         diffusion_params = BoltzDiffusionParams()
         step_scale = 1.638 if step_scale is None else step_scale
         diffusion_params.step_scale = step_scale
+        if gamma_0 is not None:
+            diffusion_params.gamma_0 = gamma_0
+        diffusion_params.use_heun = use_heun
+        diffusion_params.deterministic_sampler = deterministic_sampler
         pairformer_args = PairformerArgs()
 
     msa_args = MSAModuleArgs(

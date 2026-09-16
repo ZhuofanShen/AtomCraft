@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from math import sqrt
 
 import torch
@@ -304,6 +306,8 @@ class AtomDiffusion(Module):
         synchronize_sigmas=False,
         use_inference_model_cache=False,
         accumulate_token_repr=False,
+        use_heun=False,
+        deterministic_sampler=False,
         **kwargs,
     ):
         """Initialize the atom diffusion module.
@@ -374,6 +378,10 @@ class AtomDiffusion(Module):
         self.synchronize_sigmas = synchronize_sigmas
         self.use_inference_model_cache = use_inference_model_cache
 
+        # AtomCraft: optional Heun corrector and deterministic (low-variance,
+        # SVD-free) reverse sampler. See boltz1 tree for the rationale.
+        self.use_heun = use_heun
+        self.deterministic_sampler = deterministic_sampler
         self.accumulate_token_repr = accumulate_token_repr
         self.token_s = score_model_args["token_s"]
         if self.accumulate_token_repr:
@@ -437,7 +445,7 @@ class AtomDiffusion(Module):
         sigmas = (
             self.sigma_max**inv_rho
             + steps
-            / (num_sampling_steps - 1)
+            / max(num_sampling_steps - 1, 1)  # guard num_sampling_steps == 1
             * (self.sigma_min**inv_rho - self.sigma_max**inv_rho)
         ) ** self.rho
 
@@ -486,6 +494,10 @@ class AtomDiffusion(Module):
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
         sigmas = self.sample_schedule(num_sampling_steps)
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
+        # Deterministic sampler: zero the churn so t_hat == sigma_tm and the
+        # eps injection sqrt(t_hat**2 - sigma_tm**2) * randn vanishes.
+        if getattr(self, "deterministic_sampler", False):
+            gammas = torch.zeros_like(gammas)
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
 
         # atom position is noise at the beginning
@@ -497,11 +509,27 @@ class AtomDiffusion(Module):
         token_repr = None
         token_a = None
 
+        # When attach_coords is set on the module, drop the no_grad wrapper
+        # around the sampler so sample_atom_coords keeps its grad graph into
+        # the confidence head. NOTE: unlike the boltz1 tree, this block also
+        # covers the steering/FK-resampling code, which is off by default.
+        sampler_ctx = (
+            nullcontext if getattr(self, "attach_coords", False) else torch.no_grad
+        )
+
         # gradually denoise
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
             random_R, random_tr = compute_random_augmentation(
                 multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
             )
+            if getattr(self, "deterministic_sampler", False):
+                # Keep centering (the network expects centered input) but drop
+                # the random rotation/translation that makes sample() a random
+                # function of the sequence.
+                random_R = torch.eye(
+                    3, device=random_R.device, dtype=random_R.dtype
+                ).expand_as(random_R)
+                random_tr = torch.zeros_like(random_tr)
             atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
             atom_coords = (
                 torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
@@ -529,7 +557,7 @@ class AtomDiffusion(Module):
             eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
             atom_coords_noisy = atom_coords + eps
 
-            with torch.no_grad():
+            with sampler_ctx():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
                 token_a = torch.zeros(token_repr_shape).to(atom_coords_noisy)
 
@@ -686,7 +714,9 @@ class AtomDiffusion(Module):
                         times=self.c_noise(sigma), acc_a=token_repr, next_a=token_a
                     )
 
-            if self.alignment_reverse_diff:
+            if self.alignment_reverse_diff and not getattr(
+                self, "deterministic_sampler", False
+            ):
                 with torch.autocast("cuda", enabled=False):
                     atom_coords_noisy = weighted_rigid_align(
                         atom_coords_noisy.float(),
@@ -702,6 +732,38 @@ class AtomDiffusion(Module):
                 atom_coords_noisy
                 + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
+
+            # Heun second-order corrector: re-evaluate the score at the
+            # Euler-predicted point and average with the predictor score.
+            # Skipped at the last step where sigma_t == 0.
+            if getattr(self, "use_heun", False) and sigma_t > 0:
+                with sampler_ctx():
+                    atom_coords_denoised_2 = torch.zeros_like(atom_coords_next)
+                    heun_ids = torch.arange(multiplicity).to(atom_coords_next.device)
+                    for heun_chunk in heun_ids.chunk(
+                        multiplicity % max_parallel_samples + 1
+                    ):
+                        chunk_denoised, _ = self.preconditioned_network_forward(
+                            atom_coords_next[heun_chunk],
+                            sigma_t,
+                            training=False,
+                            network_condition_kwargs=dict(
+                                multiplicity=heun_chunk.numel(),
+                                model_cache=model_cache,
+                                **network_condition_kwargs,
+                            ),
+                        )
+                        atom_coords_denoised_2[heun_chunk] = chunk_denoised
+                denoised_over_sigma_2 = (
+                    atom_coords_next - atom_coords_denoised_2
+                ) / sigma_t
+                atom_coords_next = (
+                    atom_coords_noisy
+                    + self.step_scale
+                    * (sigma_t - t_hat)
+                    * (denoised_over_sigma + denoised_over_sigma_2)
+                    / 2
+                )
 
             atom_coords = atom_coords_next
 
