@@ -27,6 +27,8 @@ _LOSS_GROUPS = {
         ('i_con_loss',               'Inter-Contact Loss',        '#3366ff'),
         ('inter_target_con_loss',    'Inter-Target Contact Loss', '#ff66cc'),
         ('helix_loss',               'Helix Loss',                '#ffaa00'),
+        ('strand_loss',              'Strand Loss',               '#66ccff'),
+        ('sheet_pair_loss',          'Sheet-Pair Loss',           '#ccff66'),
         ('motif_distogram_loss',     'Motif Distogram Loss',      '#aa66ff'),
         ('atom_pair_distogram_loss', 'Atom-Pair Distogram Loss',  '#66ffcc'),
     ],

@@ -50,14 +50,30 @@ def get_con_loss(dgram, dgram_bins, num=None, seqsep=None, num_pos = float("inf"
 def _get_con_loss(dgram, dgram_bins, cutoff=None, binary=False):
     '''dgram to contacts'''
     if cutoff is None: cutoff = dgram_bins[-1]
-    bins = dgram_bins < cutoff  
+    bins = dgram_bins < cutoff
     px = torch.softmax(dgram, dim=-1)
-    px_ = torch.softmax(dgram - 1e7 * (~ bins), dim=-1)        
+    px_ = torch.softmax(dgram - 1e7 * (~ bins), dim=-1)
     # binary/categorical cross-entropy
     con_loss_cat_ent = -(px_ * torch.log_softmax(dgram, dim=-1)).sum(-1)
     con_loss_bin_ent = -torch.log((bins * px + 1e-8).sum(-1))
 
     return binary * con_loss_bin_ent + (1 - binary) * con_loss_cat_ent
+
+
+def _get_far_loss(dgram, dgram_bins, floor=None, binary=False):
+    '''Mirror of _get_con_loss: rewards P(d > floor) instead of P(d < cutoff).
+
+    Used to bias a residue pair toward EXTENDED backbone geometry (large Cbeta
+    separation at a fixed sequence offset). Same numerical shape as the contact
+    loss so it composes cleanly with the helix/strand diagonal-extraction trick.
+    '''
+    if floor is None: floor = dgram_bins[0]
+    bins = dgram_bins > floor
+    px = torch.softmax(dgram, dim=-1)
+    px_ = torch.softmax(dgram - 1e7 * (~ bins), dim=-1)
+    far_loss_cat_ent = -(px_ * torch.log_softmax(dgram, dim=-1)).sum(-1)
+    far_loss_bin_ent = -torch.log((bins * px + 1e-8).sum(-1))
+    return binary * far_loss_bin_ent + (1 - binary) * far_loss_cat_ent
 
 
 def mask_loss(x, mask=None, mask_grad=False):
@@ -93,7 +109,7 @@ def _get_helix_loss(dgram, dgram_bins, offset=None, mask_2d=None, binary=False, 
         if mask_2d is None:
             return x.diagonal(offset=3).mean()
         else:
-            mask_2d = mask_2d.float() 
+            mask_2d = mask_2d.float()
             return (x * mask_2d).diagonal(offset=3, dim1=-2, dim2=-1).sum() / (torch.diagonal(mask_2d, offset=3, dim1=-2, dim2=-1).sum() + 1e-8)
 
     else:
@@ -101,6 +117,35 @@ def _get_helix_loss(dgram, dgram_bins, offset=None, mask_2d=None, binary=False, 
         if mask_2d is not None:
             mask = mask * mask_2d.float()
         return (x * mask).sum() / (mask.sum() + 1e-8)
+
+
+def _get_strand_loss(dgram, dgram_bins, diag_offset=2, floor=6.5,
+                     mask_2d=None, binary=True, **kwargs):
+    '''Local extended/beta backbone bias -- mirror of _get_helix_loss.
+
+    Rewards P(d(i, i+diag_offset) > floor) on the pseudo-Cbeta distogram.
+    Rationale: at i,i+2 the Ca (~Cbeta) separation is ~6.5 A in extended /
+    strand conformation vs ~5.4 A in a helix (the helix backbone curls in),
+    so the same diagonal-extraction trick used for the helix loss picks out
+    strand propensity when you flip the primitive from `close` to `far`.
+
+    Positive weights encourage extended geometry over the (optionally
+    mask_2d-restricted) region -- typically applied to designer-chosen
+    framework stretches you want to become beta strands. Off (zero weight)
+    unless explicitly enabled; nanobody framework strands are the natural
+    use case.
+
+    Off-diagonal generalization is intentionally omitted here (that's the
+    Tier-1 unsupervised strand-pairing job, done at the wire-in site with
+    a plain get_con_loss call at strand-pairing cutoff/seqsep).
+    '''
+    x = _get_far_loss(dgram, dgram_bins, floor=floor, binary=binary)
+    if mask_2d is None:
+        return x.diagonal(offset=diag_offset, dim1=-2, dim2=-1).mean()
+    mask_2d = mask_2d.float()
+    num = (x * mask_2d).diagonal(offset=diag_offset, dim1=-2, dim2=-1).sum()
+    den = torch.diagonal(mask_2d, offset=diag_offset, dim1=-2, dim2=-1).sum()
+    return num / (den + 1e-8)
 
 
 def get_ca_coords(sample_atom_coords, batch, binder_chain='A'):
@@ -312,6 +357,99 @@ def parse_residue_spec(spec):
     return residues
 
 
+def parse_chain_residues(spec, *, allow_atom_suffix=False, allow_ranges=True,
+                         flag='--residues'):
+    """Unified parser for chain-prefixed residue selections.
+
+    Grammar (one CANONICAL form, hard-break -- no ':' between chain and resnum):
+        token       := chain resnum ('-' resnum)? atom_suffix?
+        chain       := [A-Za-z]+       (one or more alphabetic characters)
+        resnum      := [0-9]+
+        atom_suffix := ':' ('ALL' | atom (',' atom)*)   # only if allow_atom_suffix
+        separators  := whitespace, ',', or ';' between tokens
+
+    Examples (allow_atom_suffix=False, the common no-atoms form):
+        "B35"            -> [('B', 35, None)]
+        "B50-70 B95"     -> [('B', 50, None), ..., ('B', 70, None), ('B', 95, None)]
+        "AA10"           -> [('AA', 10, None)]             # multi-letter chain
+    Examples (allow_atom_suffix=True, motif form):
+        "A57 A102:CB"    -> [('A', 57, None), ('A', 102, ['CB'])]
+        "A47:SG,CA"      -> [('A', 47, ['SG', 'CA'])]
+        "B1:ALL"         -> [('B', 1, 'ALL')]
+
+    Returns a flat list of `(chain, resnum, atoms_or_None)`. `atoms` is None
+    when the token has no suffix, 'ALL' for the wildcard, else a list of
+    uppercased atom names. Empty / None spec -> [].
+
+    Malformed inputs raise ValueError with a hint that includes the flag name.
+    In particular a colon between chain and resnum (`B:50`, the pre-unification
+    grammar for the target/pair family) is rejected with a clear "use `B50`"
+    message.
+    """
+    if spec is None or spec == '':
+        return []
+    if isinstance(spec, (list, tuple)):
+        spec = ' '.join(str(x) for x in spec)
+    import re
+    # Token separator: commas are RESERVED inside ':ATOMS' when the atom-
+    # suffix mode is active (e.g. 'A102:CA,C' is ONE residue with two atoms,
+    # not two tokens). Split whitespace + semicolon only in that mode; when
+    # atom suffixes are disallowed the outer comma is safe as a token break.
+    _sep = r'[\s;]+' if allow_atom_suffix else r'[\s,;]+'
+    tokens = [t for t in re.split(_sep, str(spec).strip()) if t]
+    out = []
+    for tok in tokens:
+        # Split off the atom suffix (only meaningful when allowed).
+        body, sep, atomspec = tok.partition(':')
+        body = body.strip()
+        # Chain letters at the front of `body`. If body is empty, this
+        # catches leading-':' junk like ':CA'.
+        i = 0
+        while i < len(body) and body[i].isalpha():
+            i += 1
+        if i == 0:
+            raise ValueError(
+                f"{flag} token {tok!r} must be CHAIN+RESNUM "
+                f"(e.g. 'A57' or 'A10-14'); bare residue numbers are not "
+                f"accepted -- prefix the chain explicitly.")
+        chain, rbody = body[:i], body[i:]
+        # ':' rejection when suffix disallowed: distinguish the pre-migration
+        # 'CHAIN:RESNUM' form (rbody is empty because the digits are past the
+        # colon) from a genuine ':ATOMS' request.
+        if sep == ':' and not allow_atom_suffix:
+            if not rbody and atomspec and atomspec[:1].isdigit():
+                raise ValueError(
+                    f"{flag} token {tok!r}: the ':' separator between chain "
+                    f"and residue number is no longer accepted -- write "
+                    f"'{chain}{atomspec}' (no colon). ':ATOMS' suffixes are "
+                    f"only valid on the motif flags.")
+            raise ValueError(
+                f"{flag} token {tok!r}: ':ATOMS' suffix is not allowed on "
+                f"this flag -- write '{chain}{rbody}' (no colon).")
+        if not rbody:
+            raise ValueError(
+                f"{flag} token {tok!r} has a chain but no residue number")
+        if not rbody.lstrip('-').isdigit() and '-' not in rbody:
+            raise ValueError(
+                f"{flag} token {tok!r}: residue number must be an integer "
+                f"(got {rbody!r})")
+        atoms = _parse_atom_suffix(atomspec, flag, tok) if allow_atom_suffix else None
+        if '-' in rbody and not rbody.startswith('-'):
+            if not allow_ranges:
+                raise ValueError(
+                    f"{flag} token {tok!r}: ranges are not allowed on this "
+                    f"flag; list each residue explicitly.")
+            lo, hi = rbody.split('-', 1)
+            lo, hi = int(lo), int(hi)
+            if hi < lo:
+                lo, hi = hi, lo
+            for r in range(lo, hi + 1):
+                out.append((chain, r, atoms))
+        else:
+            out.append((chain, int(rbody), atoms))
+    return out
+
+
 def _parse_atom_suffix(atomspec, flag, tok):
     """Parse the optional ``:ATOMS`` suffix of a motif token.
 
@@ -342,28 +480,12 @@ def _parse_atom_suffix(atomspec, flag, tok):
 def _parse_residue_token(tok, flag='--motif_residues'):
     """Parse one ``CHAIN+RESNUM[:ATOMS]`` token into a list of
     ``(chain, resnum, atoms)`` -- one entry, or several when ``RESNUM`` is an
-    inclusive range (``A10-14``). ``atoms`` is ``None`` / ``'ALL'`` / list of
-    names (the shared ``:ATOMS`` selection). Shared by ``parse_motif_residue_spec``
-    and ``parse_motif_islands_spec``.
+    inclusive range (``A10-14``). Thin wrapper over :func:`parse_chain_residues`
+    kept for the ``parse_motif_islands_spec`` per-token call site; the shared
+    grammar (motif family: chain+resnum, optional ':ATOMS') lives in
+    ``parse_chain_residues(allow_atom_suffix=True)``.
     """
-    body, _, atomspec = tok.partition(':')
-    body = body.strip()
-    i = 0
-    while i < len(body) and body[i].isalpha():
-        i += 1
-    if i == 0:
-        raise ValueError(
-            f"{flag} token '{tok}' must be CHAIN+RESNUM (e.g. 'A57', 'A10-14', "
-            f"or 'A57:CA,C'); bare residue numbers are not accepted -- prefix "
-            f"the chain explicitly.")
-    chain, rbody = body[:i], body[i:]
-    if not rbody:
-        raise ValueError(f"{flag} token '{tok}' has a chain but no residue number")
-    atoms = _parse_atom_suffix(atomspec, flag, tok)
-    if '-' in rbody and not rbody.startswith('-'):
-        lo, hi = rbody.split('-')
-        return [(chain, r, atoms) for r in range(int(lo), int(hi) + 1)]
-    return [(chain, int(rbody), atoms)]
+    return parse_chain_residues(tok, allow_atom_suffix=True, flag=flag)
 
 
 def parse_motif_residue_spec(spec, with_atoms=False):
@@ -513,31 +635,13 @@ def parse_motif_ligand_spec(spec, with_atoms=False):
     Returns ``(chain, resnum)`` tuples by default, or ``(chain, resnum, atoms)``
     when ``with_atoms=True`` (``atoms`` is None / 'ALL' / list of names).
     """
-    if spec is None or spec == '':
-        return []
-    out = []
-    for ws_tok in str(spec).split():
-        sub = [ws_tok] if ':' in ws_tok else [t for t in ws_tok.split(',') if t.strip()]
-        for tok in sub:
-            tok = tok.strip()
-            if not tok:
-                continue
-            body, _, atomspec = tok.partition(':')
-            body = body.strip()
-            i = 0
-            while i < len(body) and body[i].isalpha():
-                i += 1
-            if i == 0:
-                raise ValueError(
-                    f"--motif_ligand_residues token '{tok}' must be CHAIN+RESNUM "
-                    f"(e.g. 'B1' = chain B, residue 1, or 'B1:FE')")
-            chain, rbody = body[:i], body[i:]
-            if not rbody or not rbody.lstrip('-').isdigit():
-                raise ValueError(
-                    f"--motif_ligand_residues token '{tok}': residue number "
-                    f"must be an integer")
-            atoms = _parse_atom_suffix(atomspec, '--motif_ligand_residues', tok)
-            out.append((chain, int(rbody), atoms))
+    # Shared motif-family grammar (chain+resnum with optional ':ATOMS'),
+    # delegated to the unified parser. `parse_chain_residues` handles the
+    # whitespace/comma/semicolon token split and rejects malformed inputs
+    # with a clear message; here we only need to reshape the output to
+    # preserve the legacy `with_atoms` toggle.
+    out = parse_chain_residues(spec, allow_atom_suffix=True,
+                               flag='--motif_ligand_residues')
     return out if with_atoms else [(c, r) for c, r, _ in out]
 
 

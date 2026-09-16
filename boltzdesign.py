@@ -139,14 +139,15 @@ Examples:
     # Constraints
     parser.add_argument('--contact_residues', type=str, nargs='+', default=[],
                         help='Pocket-conditioning contact residues, one token per '
-                             'contact: CHAIN:RESNUM (YAML chain ID, 1-indexed). '
+                             'contact: CHAIN+RESNUM (YAML chain ID, 1-indexed; '
+                             'no colon between them). Ranges accepted (B99-105). '
                              'Multi-target pockets supported by mixing chains: '
-                             '--contact_residues B:99 B:100 C:200 says "binder should '
+                             '--contact_residues B99 B100 C200 says "binder should '
                              'contact residues 99,100 of chain B AND residue 200 of '
                              'chain C." The model receives a single union pocket '
-                             'constraint. Old "99,100,109" form (bare numbers + '
-                             '--constraint_target) is no longer accepted -- prefix '
-                             'each token with its chain.')
+                             'constraint. Bare numbers (no chain prefix) and the '
+                             'pre-unification "B:99" colon form are no longer '
+                             'accepted -- prefix each token with its chain, no colon.')
 
     # Design parameters
     parser.add_argument('--length_min', type=int, default=100,
@@ -264,37 +265,65 @@ Examples:
     # Inter-chain epitope targeting. Restrict WHICH target residues are visible
     # to the inter-chain losses, independently for the contact term and the PAE
     # term. Chain-prefixed, 1-indexed residue positions within the target chain
-    # (same CHAIN:RESNUM convention as --contact_residues / --atom_pairs polymer
-    # selectors), ranges allowed. A target chain NOT named keeps its full
-    # sequence for that loss, so a subset on one chain never masks the others.
-    # Polymer targets only (1 token == 1 residue); for small_molecule/metal
-    # targets toggle the whole term with --i_con_loss / --i_pae_loss = 0 instead.
+    # (CHAIN+RESNUM convention -- letters then digits, no colon; same grammar
+    # as --contact_residues and --motif_residues), ranges allowed. A target
+    # chain NOT named keeps its full sequence for that loss, so a subset on
+    # one chain never masks the others. Polymer targets only (1 token == 1
+    # residue); for small_molecule/metal targets toggle the whole term with
+    # --i_con_loss / --i_pae_loss = 0 instead.
     parser.add_argument('--i_con_target_residues', type=str, nargs='+', default=[],
                         help='Restrict which TARGET residues are visible to the '
                              'inter-chain CONTACT loss (--i_con_loss / '
                              '--num_inter_contacts). Chain-prefixed, 1-indexed '
                              'positions within the target chain, ranges allowed: '
-                             '--i_con_target_residues B:50-70 B:95 C:1-10. A target '
+                             '--i_con_target_residues B50-70 B95 C1-10. A target '
                              'chain not listed uses its full sequence (legacy). '
-                             'Old "B:50-70,B:95" comma form also works.')
+                             'The pre-unification "B:50-70" colon form is no '
+                             'longer accepted -- write "B50-70" instead.')
     parser.add_argument('--i_pae_target_residues', type=str, nargs='+', default=[],
                         help='Restrict which TARGET residues are visible to the '
                              'inter-chain PAE loss (--i_pae_loss). Same '
-                             'CHAIN:RESNUM / CHAIN:start-end syntax as '
+                             'CHAIN+RESNUM / CHAIN+start-end syntax as '
                              '--i_con_target_residues; independent selection. '
                              'Unlisted chains use their full sequence.')
+    # Paratope targeting (binder-side mirror of --i_con_target_residues).
+    # Space-separated 1-indexed positions within the binder chain, same
+    # grammar as --motif_binder_positions: each token is a single residue
+    # ("57") or an inclusive range ("26-32"). Single chain by construction
+    # (no chain prefix -- binder is always --binder_id). Empty => full binder.
+    parser.add_argument('--i_con_binder_residues', type=str, nargs='+', default=[],
+                        help='Restrict which BINDER residues are counted by the '
+                             'inter-chain CONTACT loss (paratope targeting). '
+                             'Space-separated 1-indexed positions within the '
+                             'binder chain, ranges allowed -- same grammar as '
+                             '--motif_binder_positions: '
+                             '--i_con_binder_residues 26-32 53-67 100-126. '
+                             'No chain prefix (binder is always --binder_id). '
+                             'Typical VHH use: pin the paratope to the three '
+                             'CDRs so framework residues stop being rewarded '
+                             'for contacting the target. Empty (default) => '
+                             'full binder. Applies to --i_con_loss only; PAE / '
+                             'target_plddt / motif / inter-target losses still '
+                             'see the full binder. Interacts with '
+                             '--optimize_contact_per_binder_pos + '
+                             '--increasing_contact_over_itr: '
+                             '--num_optimizing_binder_pos is clamped to the '
+                             'paratope size so the annealing ramp can\'t '
+                             'silently saturate on a CDR set smaller than the '
+                             'scheduled count.')
 
     # Auxiliary INTER-TARGET interactions. Optimize contacts / interface-PAE
     # BETWEEN two target chains (not the binder), computed with the SAME loss
     # functions as the binder<->target i_con_loss / i_pae_loss and added as
     # separate, separately-plotted terms. Each pair token is
     # "<sideA> | <sideB>" (also "<sideA> and <sideB>" / "<sideA> vs <sideB>");
-    # each side is one or more CHAIN:RESNUM / CHAIN:start-end selections
-    # (comma/space separated), both sides target chains. Quote each pair.
+    # each side is one or more CHAIN+RESNUM / CHAIN+start-end selections
+    # (letters then digits, no colon; comma/space separated), both sides
+    # target chains. Quote each pair.
     parser.add_argument('--inter_target_con_pairs', type=str, nargs='+', default=[],
                         help='Inter-target residue pairs whose CONTACTS to '
                              'optimize, e.g. --inter_target_con_pairs '
-                             '"B:45-47 | C:52" "B:103 | D:82-91,D:98". Uses the '
+                             '"B45-47 | C52" "B103 | D82-91,D98". Uses the '
                              'same contact loss as i_con_loss; weight set by '
                              '--inter_target_con_loss, hyperparameters by '
                              '--inter_target_num_contacts / --inter_target_cutoff. '
@@ -302,7 +331,7 @@ Examples:
     parser.add_argument('--inter_target_pae_pairs', type=str, nargs='+', default=[],
                         help='Inter-target residue pairs whose INTERFACE PAE to '
                              'optimize, e.g. --inter_target_pae_pairs '
-                             '"B:45-47 | C:52" "B:103 | D:82-91,D:98". Uses the '
+                             '"B45-47 | C52" "B103 | D82-91,D98". Uses the '
                              'same PAE loss as i_pae_loss; weight set by '
                              '--inter_target_pae_loss. Independent of '
                              '--inter_target_con_pairs (pass the same pairs in '
@@ -370,6 +399,73 @@ Examples:
                         help='Maximum helix loss weights')
     parser.add_argument('--helix_loss_min', type=float, default=-0.3,
                         help='Minimum helix loss weights')
+    # --- Region-scoped helix-loss EXCLUSION mask (counterpart of --strand_residues).
+    # User-facing meaning is symmetric ("residues where I WANT this SS type"),
+    # but the polarity is inverted internally: helix loss is applied with a
+    # negative (penalizing) weight, so "let helices form here" == "drop the
+    # penalty here" == zero those residues in the 2D mask. Empty = full-binder
+    # mask (legacy behavior, byte-identical).
+    parser.add_argument('--helix_residues', type=str, nargs='+', default=[],
+                        help='Chain-relative 1-indexed binder residues where '
+                             'the anti-helix bias should NOT apply, e.g. '
+                             '--helix_residues 26-32 100-126 lets a VHH\'s '
+                             'CDR1 / CDR3 form helices without penalty while '
+                             'the rest of the binder still gets the global '
+                             'helix penalty (--helix_loss_min / '
+                             '--helix_loss_max). Space-separated tokens '
+                             '(unquoted) OR legacy comma-form ("26-32,100-126") '
+                             'both work. Ranges inclusive. Empty = full-binder '
+                             'mask (legacy). Same grammar as --strand_residues '
+                             '/ --motif_binder_positions / '
+                             '--i_con_binder_residues.')
+    # --- Local strand-propensity loss (mirror of helix loss, flipped to `far`).
+    parser.add_argument('--strand_residues', type=str, nargs='+', default=[],
+                        help='Chain-relative 1-indexed binder residues to bias '
+                             'toward extended (beta-strand) backbone, e.g. '
+                             '--strand_residues 1-10 25-32. Space-separated '
+                             'tokens (unquoted) OR legacy comma-form '
+                             '("1-10,25-32") both work. Ranges inclusive. '
+                             'Empty = off. Loss uses the (i, i+2) "far" '
+                             'diagonal on the pseudo-Cbeta distogram (mirror '
+                             'of the helix loss). Off unless the strand_loss '
+                             'weight is positive and this is set.')
+    parser.add_argument('--strand_loss_max', type=float, default=0.0,
+                        help='Maximum strand loss weight (per-iter uniform '
+                             'sample from [min, max], like helix). Default 0 '
+                             '=> off.')
+    parser.add_argument('--strand_loss_min', type=float, default=0.0,
+                        help='Minimum strand loss weight. Default 0 => off.')
+    parser.add_argument('--strand_loss_offset', type=int, default=2,
+                        help='Diagonal offset for the strand loss (i, i+offset). '
+                             'Default 2 (Ca separation ~6.5 A in extended vs '
+                             '~5.4 A in helix at this offset).')
+    parser.add_argument('--strand_loss_floor', type=float, default=6.5,
+                        help='Cbeta-distance floor for the strand-far loss (A). '
+                             'Default 6.5.')
+    # --- Tier-1 unsupervised strand-strand pairing loss (get_con_loss retuned).
+    parser.add_argument('--sheet_pair_loss', type=float, default=0.0,
+                        help='Tier-1 unsupervised strand-strand pairing loss '
+                             'weight. Intra-binder get_con_loss(cutoff='
+                             '--sheet_pair_cutoff, seqsep=--sheet_pair_seqsep, '
+                             'num=--sheet_pair_num) that forces each binder '
+                             'residue to have at least one CLOSE, LONG-RANGE '
+                             'partner (helix/turn contacts excluded by seqsep). '
+                             'Fully unsupervised (no strand identities). '
+                             'Default 0 => off. Try 0.3-1.0 for nanobody-like '
+                             'designs where the intra-contact loss under-'
+                             'produces sheet content.')
+    parser.add_argument('--sheet_pair_cutoff', type=float, default=5.5,
+                        help='Distance cutoff (A) for the sheet-pair contact '
+                             'primitive. Default 5.5 (Cbeta strand-partner '
+                             'spacing).')
+    parser.add_argument('--sheet_pair_seqsep', type=int, default=5,
+                        help='Sequence-separation gate for the sheet-pair '
+                             'primitive (partner must satisfy |i-j| >= seqsep, '
+                             'so helix/turn contacts are excluded). Default 5.')
+    parser.add_argument('--sheet_pair_num', type=int, default=1,
+                        help='Number of closest partners per binder residue '
+                             'counted by the sheet-pair loss (num in '
+                             'get_con_loss). Default 1 = one partner per row.')
     parser.add_argument('--motif_distogram_loss', type=float, default=0.0,
                         help='Motif scaffolding distogram-CCE loss weight '
                              '(ColabDesign `partial` dgram_cce). Only used when '
@@ -491,6 +587,41 @@ Examples:
                         help='Pin the motif residues to the reference sequence '
                              '(retained + grad-frozen). False = scaffold '
                              'geometry only, sequence stays designable.')
+
+    # Explicit sequence pinning, independent of the motif machinery. No
+    # reference PDB and no geometry restraint -- a plain 1-to-1
+    # (binder position -> amino acid) map.
+    parser.add_argument('--fix_seq_positions', type=str, nargs='+', default=[],
+                        help='Binder positions to pin to an explicit amino acid, '
+                             'paired 1-to-1 IN ORDER with --fix_seq. Space-'
+                             'separated 1-indexed positions within the binder '
+                             'chain, ranges allowed -- same grammar as '
+                             '--motif_binder_positions / --i_con_binder_residues: '
+                             '--fix_seq_positions 35 67-70 --fix_seq E GKDF pins '
+                             'position 35 to E and 67,68,69,70 to G,K,D,F. No '
+                             'chain prefix (binder is always --binder_id). '
+                             'Positions must be <= the sampled binder length, so '
+                             'set --length_min high enough. Unlike '
+                             '--motif_residues this adds NO geometry loss -- the '
+                             'identities are fixed, the structure stays free. '
+                             'Requires --fix_seq; empty (default) => off.')
+    parser.add_argument('--fix_seq', type=str, nargs='+', default=[],
+                        help='The amino acids for --fix_seq_positions, one '
+                             'one-letter code per selected position, in the same '
+                             'order: --fix_seq E GKDF. Whitespace between groups '
+                             'is ignored (E GKDF == EGKDF), so group them to '
+                             'mirror --fix_seq_positions for readability. Only '
+                             'the 20 standard amino acids are accepted; the '
+                             'total letter count must equal the number of '
+                             'positions --fix_seq_positions resolves to. The pin '
+                             'is a constant res_type write every step (it '
+                             'survives the soft/hard/omit machinery, including '
+                             'residues like Cys that are otherwise excluded from '
+                             'design) plus a grad freeze, and it also blocks '
+                             'semi-greedy mutations at those positions. It does '
+                             'NOT carry into the downstream LigandMPNN/'
+                             'ProteinMPNN redesign. Requires '
+                             '--fix_seq_positions.')
     parser.add_argument('--motif_ligand_residues', type=str, nargs='+', default=[],
                         help='Optional ligand residues in --motif_pdb to carry '
                              'along with the motif under --motif_coords_loss, one '
@@ -610,10 +741,10 @@ Examples:
                         help='Disable high iPTM designs')
     # Paths
     parser.add_argument('--boltz_checkpoint', type=str,
-        default='/opt/boltz1_weights/boltz1_conf.ckpt',
+        default='/ai/share/workspace/zhuofanshen/ckpts/boltz1_conf.ckpt',
         help='Path to Boltz checkpoint')
     parser.add_argument('--ccd_path', type=str,
-        default='/opt/boltz1_weights/ccd.pkl',
+        default='/ai/share/workspace/zhuofanshen/ckpts/ccd.pkl',
         help='Path to CCD file')
     parser.add_argument('--alphafold_dir', type=str,
         default='/opt/alphafold3',
@@ -715,33 +846,25 @@ def _split_csv(value):
 def parse_contact_residues_spec(tokens):
     """Parse chain-prefixed --contact_residues tokens into [(chain, res), ...].
 
-    Each token is CHAIN:RESNUM where CHAIN is a single uppercase letter (YAML
-    chain ID) and RESNUM is a 1-indexed integer. Accepts the legacy quoted /
-    comma forms via _split_csv (so "B:99 B:100 C:200", "B:99,B:100,C:200" and
-    --contact_residues B:99 B:100 C:200 all parse identically). Bare numbers
-    are rejected with a clear migration error pointing to the new format.
+    Each token is CHAIN+RESNUM where CHAIN is a single uppercase letter (YAML
+    chain ID) and RESNUM is a 1-indexed integer. Ranges are also accepted
+    (`B99-105`). Accepts the legacy quoted / comma forms via _split_csv (so
+    "B99 B100 C200", "B99,B100,C200" and --contact_residues B99 B100 C200 all
+    parse identically). Bare numbers and the pre-migration 'B:99' colon form
+    are rejected with a clear message.
+
+    Delegates the token grammar to the unified `parse_chain_residues` and
+    just enforces the additional 'single uppercase letter' invariant.
     """
+    joined = ' '.join(_split_csv(tokens))
     out = []
-    for tok in _split_csv(tokens):
-        if ":" not in tok:
-            raise ValueError(
-                f"--contact_residues token '{tok}' is missing a chain prefix. "
-                f"Use CHAIN:RESNUM (e.g. B:99). The bare-number form + "
-                f"--constraint_target is no longer supported -- prefix the "
-                f"chain on every token.")
-        chain, res = tok.split(":", 1)
-        chain, res = chain.strip(), res.strip()
+    for chain, resnum, _atoms in parse_chain_residues(
+            joined, allow_atom_suffix=False, flag='--contact_residues'):
         if len(chain) != 1 or not chain.isupper():
             raise ValueError(
-                f"--contact_residues token '{tok}': chain prefix must be one "
-                f"uppercase letter (got '{chain}')")
-        try:
-            res_int = int(res)
-        except ValueError:
-            raise ValueError(
-                f"--contact_residues token '{tok}': residue '{res}' is not an "
-                f"integer")
-        out.append((chain, res_int))
+                f"--contact_residues: chain prefix must be one uppercase "
+                f"letter (got {chain!r})")
+        out.append((chain, resnum))
     return out
 
 
@@ -1005,6 +1128,11 @@ def update_config_with_args(config, args):
     # string => full sequence for every target (inert, legacy behavior).
     'i_con_target_residues': " ".join(_split_csv(args.i_con_target_residues)),
     'i_pae_target_residues': " ".join(_split_csv(args.i_pae_target_residues)),
+    # Binder-side paratope selection (single chain, bare 1-indexed positions).
+    # Joined with commas -- NOT spaces -- because the downstream parser here
+    # is parse_residue_spec (the --motif_binder_positions parser), which
+    # splits on commas only. Mirrors the motif_binder_positions plumbing.
+    'i_con_binder_residues': ",".join(_split_csv(args.i_con_binder_residues)),
     # Auxiliary inter-target pair specs passed through as LISTS of pair-strings
     # (NOT _split_csv'd: commas separate residue selections WITHIN a side, and
     # '|'/'and' separate the two sides, so each nargs token is one pair and must
@@ -1056,6 +1184,22 @@ def update_config_with_args(config, args):
         'num_intra_contacts': args.num_intra_contacts,
         'helix_loss_max': args.helix_loss_max,
         'helix_loss_min': args.helix_loss_min,
+        # --helix_residues (user-facing) becomes helix_exclude_residues at the
+        # kwarg / config layer (unambiguous internal name; the CLI keeps the
+        # symmetric "residues where I WANT this SS type" wording). Both bare-
+        # position flags accept a mix of nargs tokens and legacy comma-form
+        # (mirror of --i_con_binder_residues / --motif_binder_positions),
+        # joined with commas because parse_residue_spec splits on ',' only.
+        'helix_exclude_residues': ",".join(_split_csv(args.helix_residues)),
+        'strand_residues': ",".join(_split_csv(args.strand_residues)),
+        'strand_loss_offset': args.strand_loss_offset,
+        'strand_loss_floor': args.strand_loss_floor,
+        'strand_loss_min': args.strand_loss_min,
+        'strand_loss_max': args.strand_loss_max,
+        'sheet_pair_cutoff': args.sheet_pair_cutoff,
+        'sheet_pair_seqsep': args.sheet_pair_seqsep,
+        'sheet_pair_num': args.sheet_pair_num,
+        'sheet_pair_loss': args.sheet_pair_loss,
         'optimizer_type': args.optimizer_type,
         'pre_iteration': args.pre_iteration,
         'soft_iteration': args.soft_iteration,
@@ -1080,6 +1224,12 @@ def update_config_with_args(config, args):
         'motif_slide_method': args.motif_slide_method,
         'motif_slide_loss': args.motif_slide_loss,
         'fix_motif_seq': args.fix_motif_seq,
+        # Explicit sequence pin. Positions are comma-joined (parse_residue_spec
+        # splits on ',' only, like --motif_binder_positions); the amino acids
+        # are comma-joined too and the group separators are stripped downstream,
+        # so "--fix_seq E GKDF" -> "E,GKDF" -> "EGKDF".
+        'fix_seq_positions': ",".join(_split_csv(args.fix_seq_positions)),
+        'fix_seq': ",".join(_split_csv(args.fix_seq)),
         'motif_ligand_residues': " ".join(args.motif_ligand_residues),
         'motif_distogram_loss_type': args.motif_distogram_loss_type,
         'atom_pairs': "; ".join(_split_semi(args.atom_pairs)),

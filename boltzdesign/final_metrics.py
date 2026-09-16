@@ -55,7 +55,8 @@ def compute_final_metrics(boltz_model, output, best_batch, best_structure, *,
                           binder_chain='A', target_chain_ids=None, length=None,
                           atom_pairs=None, atom_angles=None,
                           com_loss_weight=0.0, pdb_path='',
-                          metric_config=None, interface_contact_cutoff=5.0):
+                          metric_config=None, interface_contact_cutoff=5.0,
+                          helix_exclude_positions=None):
     """Standardized, cross-run-comparable metrics from the final 200-step fold.
 
     `output` is the predict_step dict (coords/plddt/pae/iptm/ptm/...); `best_batch`
@@ -109,7 +110,36 @@ def compute_final_metrics(boltz_model, output, best_batch, best_structure, *,
             pae = (pae + pae.transpose(-2, -1)) / 2
             bb = (chain_mask[:, None] * chain_mask[None, :]).reshape(-1)
             conf['binder_pae'] = _masked_mean(pae.reshape(-1), bb)
-        tgt_plddt, tgt_pae, tgt_iptm = {}, {}, {}
+        # Per-chain pTM. Boltz reports `chains_ptm[i]` (pTM restricted to chain i
+        # alone, i.e. is THAT chain's own fold confident) and, redundantly, the
+        # DIAGONAL of pair_chains_iptm: pair_chains_iptm[i][i] == chains_ptm[i].
+        # Both are read, diagonal second, because the offline backfill path
+        # parses pair_chains_iptm but not chains_ptm -- so historical runs still
+        # recover binder_ptm. Distinct from conf['ptm'], which is the WHOLE
+        # complex and is dominated by the (large) target.
+        pci = output.get('pair_chains_iptm')
+        cptm = output.get('chains_ptm')
+
+        def _chain_ptm(eid):
+            """Chain-`eid` pTM, or None. Tolerates str/int keys and raw floats."""
+            if isinstance(cptm, dict):
+                for k in (eid, str(eid)):
+                    if k in cptm:
+                        v = cptm[k]
+                        return float(v.item() if hasattr(v, 'item') else v)
+            if pci is not None:
+                try:
+                    v = pci[eid][eid]
+                    return float(v.item() if hasattr(v, 'item') else v)
+                except Exception:
+                    return None
+            return None
+
+        _bptm = _chain_ptm(binder_eid)
+        if _bptm is not None:
+            conf['binder_ptm'] = _bptm
+
+        tgt_plddt, tgt_pae, tgt_iptm, tgt_ptm = {}, {}, {}, {}
         for cid in target_chain_ids:
             teid = chain_to_number_[cid]
             tmask = (entity_id == teid).to(torch.float32)
@@ -124,8 +154,13 @@ def compute_final_metrics(boltz_model, output, best_batch, best_structure, *,
                     tgt_iptm[cid] = float(pci[binder_eid][teid].item())
                 except Exception:
                     pass
+            _tptm = _chain_ptm(teid)
+            if _tptm is not None:
+                tgt_ptm[cid] = _tptm
         if tgt_plddt:
             conf['target_plddt'] = tgt_plddt
+        if tgt_ptm:
+            conf['target_ptm'] = tgt_ptm
         if tgt_pae:
             conf['interface_pae'] = tgt_pae
         if tgt_iptm:
@@ -201,7 +236,20 @@ def compute_final_metrics(boltz_model, output, best_batch, best_structure, *,
         std['con_loss'] = float(get_con_loss(
             pdistogram, mid_pts, num=num_intra, seqsep=9, cutoff=intra_cut,
             binary=False, mask_1d=chain_mask_b, mask_1b=chain_mask_b).item())
-        mask_2d = chain_mask_b[:, :, None] * chain_mask_b[:, None, :]
+        # Helix loss mask: mirror the design-loop build (`boltz_hallucination`
+        # get_model_loss). --helix_residues excludes user-selected binder
+        # positions from the anti-helix bias; if not set, the mask is the
+        # full binder (byte-identical to the pre-feature behavior).
+        _cm_1d = chain_mask_b.clone()
+        if helix_exclude_positions:
+            binder_tok = torch.where(entity_id == binder_eid)[0]
+            L_binder = int(binder_tok.numel())
+            _hp = [p for p in helix_exclude_positions if 1 <= p <= L_binder]
+            if _hp:
+                excl_tokens = binder_tok[torch.as_tensor(_hp,
+                                                          device=_cm_1d.device) - 1]
+                _cm_1d[0, excl_tokens] = 0
+        mask_2d = _cm_1d[:, :, None] * _cm_1d[:, None, :]
         std['helix_loss'] = float(_get_helix_loss(
             pdistogram, mid_pts, offset=None, mask_2d=mask_2d, binary=True).item())
 

@@ -23,8 +23,36 @@ per-restraint sub-dicts) is flattened to dotted scalar columns, e.g.
 fewer bars.
 
 Outputs (into ``--out-dir``, default ``./metric_comparison``):
-  * ``metric_<col>.png`` per metric column;
+  * ``metric_<col>.png`` per metric column -- a violin per folder (median + IQR)
+    with every design overlaid as a jittered point (``--no-points`` to omit);
+  * ``metric_panel_tm_scores.png`` -- pTM, global ipTM and each per-target-chain
+    interface ipTM side by side on one shared 0-1 axis (``--no-panel`` to omit);
   * ``metric_comparison_summary.csv`` (metric, folder, n, median, q1, q3, mean, std, min, max).
+
+pTM vs ipTM vs interface ipTM (all from ``final_metrics.compute_final_metrics``):
+  ``confidence.binder_ptm``    Boltz ``chains_ptm[binder]`` (== the diagonal
+                               ``pair_chains_iptm[binder][binder]``): is the
+                               DESIGNED BINDER's own fold confident, judged on
+                               binder tokens alone but within the complex. This
+                               is the one to read for binder foldability.
+  ``confidence.ptm``           Global pTM of the WHOLE complex treated as one
+                               unit. Dominated by the largest chain, so a big
+                               well-folded target holds it up even when the
+                               binder is neither folded nor docked.
+  ``confidence.target_ptm.<chain>``
+                               Same, per target chain -- a sanity check, since a
+                               well-behaved target should be flat across runs.
+  ``confidence.iptm``          Global interface pTM, aggregated over ALL ordered
+                               chain pairs in the complex. With a multi-chain
+                               target this includes target<->target pairs, which
+                               say nothing about the design and dilute the number.
+  ``confidence.interface_iptm.<chain>``
+                               ``output['pair_chains_iptm'][binder][<chain>]`` --
+                               the ordered binder->chain pair only. This is the
+                               per-interface number to rank designs on.
+  CAVEAT: TM-score's d0 normalization is length-dependent, so ``binder_ptm`` is
+  systematically lower for short binders. Only compare it across runs at
+  comparable ``binder_length`` (plot ``metric_binder_length.png`` to check).
 
 Pooling replicate runs: join folders with ':' in a single token to merge their
 designs into ONE box, labeled by the FIRST folder's basename.
@@ -41,6 +69,7 @@ import glob
 import json
 import math
 import os
+import random
 import re
 import statistics
 import sys
@@ -49,8 +78,13 @@ import sys
 # only the per-folder data layer (metrics JSON instead of loss CSVs) differs.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compare_loss_folders import (  # noqa: E402
-    collect_group, group_label, plot_compare, quartiles, series_for,
+    collect_group, draw_column, group_label, plot_compare, quartiles, series_for,
 )
+
+import matplotlib  # noqa: E402
+matplotlib.use("Agg")
+import matplotlib.patches  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
 
 # Keys that are config/descriptive, not metrics, or constant-per-design.
 _SKIP_KEYS = {"units", "settings", "interface_contact_cutoff_A", "rg_threshold"}
@@ -144,6 +178,104 @@ def collect_folder(folder, fold="holo"):
 def _safe(name):
     """Filesystem-safe metric column name (labels can carry ':', '@', ',', ...)."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+
+# --- TM-score panel ----------------------------------------------------------
+# Every metric already gets its own figure (the flattener has no whitelist, so
+# confidence.ptm has always been written as metric_confidence.ptm.png). What was
+# missing is a SIDE-BY-SIDE view: pTM, global ipTM and the per-target-chain
+# interface ipTM all share the same 0-1 scale, so they belong on one axis where
+# the gap between them is readable. That gap is the interesting quantity -- see
+# the note in the module docstring on ipTM vs interface_iptm.<chain>.
+_TM_PREFERRED = ["confidence.binder_ptm", "confidence.ptm", "confidence.iptm",
+                 "confidence.protein_iptm", "confidence.ligand_iptm"]
+_TM_PRETTY = {"confidence.binder_ptm": "pTM (binder alone)",
+              "confidence.ptm": "pTM (whole complex)",
+              "confidence.iptm": "ipTM (global)",
+              "confidence.protein_iptm": "protein ipTM",
+              "confidence.ligand_iptm": "ligand ipTM"}
+
+
+def tm_metrics(metric_order):
+    """The pTM/ipTM family present in `metric_order`, in a readable order:
+    binder-alone pTM, whole-complex pTM, per-target-chain pTM, then the global
+    ipTMs and each per-target-chain interface ipTM."""
+    have = set(metric_order)
+    cols = [c for c in _TM_PREFERRED[:2] if c in have]
+    cols += sorted(c for c in metric_order if c.startswith("confidence.target_ptm."))
+    cols += [c for c in _TM_PREFERRED[2:] if c in have]
+    cols += sorted(c for c in metric_order
+                   if c.startswith("confidence.interface_iptm."))
+    return cols
+
+
+def _tm_pretty(col):
+    if col in _TM_PRETTY:
+        return _TM_PRETTY[col]
+    for prefix, fmt in (("confidence.interface_iptm.", "interface ipTM {}"),
+                        ("confidence.target_ptm.", "pTM (target {})")):
+        if col.startswith(prefix):
+            return fmt.format(col.rsplit(".", 1)[-1])
+    return col
+
+
+def plot_grouped(metrics, data, labels, out_png, *, title, ylabel,
+                 pretty=None, ylim=None, show_points=True):
+    """One figure, several metrics side by side, each with a box per folder.
+
+    x is grouped by metric (one cluster per metric, one violin+points column per
+    folder inside it, folders color-coded with a legend); metrics with no data in
+    any folder are dropped. Only meaningful for metrics that share a scale.
+    """
+    pretty = pretty or (lambda c: c)
+    groups = []
+    for m in metrics:
+        cols = [(l, series_for(data[l], m)) for l in labels]
+        cols = [(l, v) for l, v in cols if v]
+        if cols:
+            groups.append((m, cols))
+    if not groups:
+        return False
+
+    palette = plt.get_cmap("tab10").colors
+    color_of = {l: palette[i % len(palette)] for i, l in enumerate(labels)}
+    n_folders = max(len(c) for _, c in groups)
+    width = min(0.72, 0.86 / max(1, n_folders))
+
+    fig, ax = plt.subplots(
+        figsize=(max(5.0, 1.35 * n_folders * len(groups) + 2.0), 5.2))
+    rng = random.Random(0)
+    centers, ticklabels = [], []
+    for gi, (metric, cols) in enumerate(groups):
+        span = (len(cols) - 1) / 2.0
+        for ci, (label, vals) in enumerate(cols):
+            pos = gi + (ci - span) * width
+            c = color_of[label]
+            draw_column(ax, pos, vals, rng, face=c, edge="#333333", point_color=c,
+                        width=width * 0.92, show_points=show_points,
+                        jitter=width * 0.22)
+        centers.append(gi)
+        ticklabels.append(pretty(metric))
+        if gi:
+            ax.axvline(gi - 0.5, color="#BBBBBB", linewidth=0.8, linestyle=":",
+                       zorder=0)
+
+    ax.set_xticks(centers)
+    ax.set_xticklabels(ticklabels, rotation=15, ha="right", fontsize=9)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    if ylim:
+        ax.set_ylim(*ylim)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.4, zorder=0)
+    drawn = [l for l in labels if any(l in dict(c) for _, c in groups)]
+    handles = [matplotlib.patches.Patch(facecolor=color_of[l], edgecolor="#333333",
+                                        alpha=0.75, label=l) for l in drawn]
+    ax.legend(handles=handles, fontsize=8, frameon=False, ncol=min(3, len(handles)),
+              loc="lower right")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+    return True
 
 
 # --- Offline backfill for historical runs (no model) -------------------------
@@ -248,6 +380,16 @@ def run_backfill(folders, fold):
                         for k1, d in pci.items()}
                 except (ValueError, TypeError):
                     pass
+            # Per-chain pTM (binder_ptm / target_ptm). Boltz's diagonal
+            # pair_chains_iptm[i][i] carries the same value, so this is belt and
+            # braces for runs whose confidence JSON has one but not the other.
+            cptm = c.get("chains_ptm")
+            if isinstance(cptm, dict):
+                try:
+                    out["chains_ptm"] = {int(k): torch.tensor(float(v))
+                                         for k, v in cptm.items()}
+                except (ValueError, TypeError):
+                    pass
         import numpy as np
         for key, fname in (("plddt", f"plddt_{name}_model_0.npz"),
                            ("pae", f"pae_{name}_model_0.npz")):
@@ -332,6 +474,10 @@ def main():
                          "which isn't saved).")
     ap.add_argument("--labels", nargs="+", default=None,
                     help="Display labels, one per token (default: first folder's basename).")
+    ap.add_argument("--no-panel", action="store_true",
+                    help="Skip the combined pTM / ipTM / interface-ipTM panel figure.")
+    ap.add_argument("--no-points", action="store_true",
+                    help="Draw violins only, without the per-design scatter overlay.")
     ap.add_argument("-o", "--out-dir", default="metric_comparison",
                     help="Where to write the comparison figures (default: ./metric_comparison).")
     args = ap.parse_args()
@@ -386,8 +532,23 @@ def main():
                     statistics.stdev(vals) if len(vals) > 1 else 0.0,
                     min(vals), max(vals)))
         out_png = os.path.join(args.out_dir, f"metric_{_safe(metric)}.png")
-        if plot_compare(metric, folder_vals, out_png, ylabel=ylabel):
+        if plot_compare(metric, folder_vals, out_png, ylabel=ylabel,
+                        show_points=not args.no_points):
             print(f"[plot] {out_png}")
+
+    # Combined TM panel: pTM / ipTM / per-chain interface ipTM on one 0-1 axis.
+    if not args.no_panel:
+        tm_cols = tm_metrics(metric_order)
+        if tm_cols:
+            panel_png = os.path.join(args.out_dir, "metric_panel_tm_scores.png")
+            if plot_grouped(tm_cols, data, present, panel_png,
+                            title=f"pTM / ipTM confidence ({args.fold})",
+                            ylabel="TM score (0-1, higher=better)",
+                            pretty=_tm_pretty, ylim=(0.0, 1.0),
+                            show_points=not args.no_points):
+                print(f"[plot] {panel_png}  ({', '.join(tm_cols)})")
+        else:
+            print("[warn] no pTM/ipTM columns found -- panel skipped.")
 
     out_csv = os.path.join(args.out_dir, "metric_comparison_summary.csv")
     with open(out_csv, "w", newline="") as f:

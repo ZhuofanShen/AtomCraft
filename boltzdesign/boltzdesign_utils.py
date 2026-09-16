@@ -16,7 +16,7 @@ from boltz.data.feature.featurizer import BoltzFeaturizer
 from boltz.data.parse.schema import parse_boltz_schema
 from boltz.data.write.mmcif import to_mmcif
 from boltz.data.write.pdb import to_pdb
-from loss_functions import get_mid_points, align_points, np_rmsd, parse_motif_ligand_spec, extract_motif_ligand_atoms, parse_motif_residue_spec, extract_motif_coords, parse_residue_spec, extract_motif_residue_atoms, _rigid_frames, parse_motif_islands_spec, island_length, random_valid_placement, get_motif_target_distances, _placement_to_positions, propose_mcmc_move, _find_named_atom, resolve_atom_pairs, resolve_atom_angles, parse_pdb_ori_atoms, _get_helix_loss, get_con_loss, get_plddt_loss, get_pae_loss, get_ca_coords, add_rg_loss, add_com_loss, get_motif_distogram_loss, get_motif_coords_loss, get_motif_fape_loss, kabsch_align, get_atom_pair_distogram_loss, get_atom_pair_coords_loss, get_atom_angle_coords_loss
+from loss_functions import get_mid_points, align_points, np_rmsd, parse_motif_ligand_spec, extract_motif_ligand_atoms, parse_motif_residue_spec, extract_motif_coords, parse_residue_spec, parse_chain_residues, extract_motif_residue_atoms, _rigid_frames, parse_motif_islands_spec, island_length, random_valid_placement, get_motif_target_distances, _placement_to_positions, propose_mcmc_move, _find_named_atom, resolve_atom_pairs, resolve_atom_angles, parse_pdb_ori_atoms, _get_helix_loss, _get_strand_loss, get_con_loss, get_plddt_loss, get_pae_loss, get_ca_coords, add_rg_loss, add_com_loss, get_motif_distogram_loss, get_motif_coords_loss, get_motif_fape_loss, kabsch_align, get_atom_pair_distogram_loss, get_atom_pair_coords_loss, get_atom_angle_coords_loss
 from plot_utils import _LOSS_GROUPS, _plot_loss_group, _atom_pair_subplot_augments, _atom_angle_subplot_augments, plot_total_loss_history, visualize_training_history
 from final_metrics import compute_final_metrics, save_metrics_json
 import yaml
@@ -30,6 +30,15 @@ import json
 import logging
 
 logging.basicConfig(level=logging.WARNING)
+
+# res_type column layout used throughout boltz_hallucination. Columns 0/1 are
+# the two X (unknown) slots and 22 is the gap, so only indices 2..21 are real
+# amino acids -- the map below is the single source of truth for the
+# one-letter-code -> res_type column conversion (motif sequence pin, --fix_seq).
+_RES_TYPE_ALPHABET = list('XXARNDCQEGHILKMFPSTWYV-')
+_AA_TO_RES_TYPE_COL = {aa: i for i, aa in enumerate(_RES_TYPE_ALPHABET)
+                       if i >= 2 and aa not in ('X', '-')}
+
 
 def save_confidence_scores(folder_dir, output, structure,name, model_idx=0):
     output_dir = os.path.join(folder_dir, f"boltz_results_{name}", "predictions", name)
@@ -288,13 +297,14 @@ def boltz_hallucination(
     # single-target shim that auto-resolves from entity_id at setup time.
     target_chain_ids=None,
     # Optional per-target residue selections that restrict WHICH target residues
-    # are visible to the inter-chain losses (epitope targeting). Chain-prefixed,
-    # 1-indexed residue positions within each target chain, range-aware:
-    # "B:50-70 B:95 C:1-10". The two selections are INDEPENDENT:
+    # are visible to the inter-chain losses (epitope targeting). Chain-prefixed
+    # CHAIN+RESNUM (letters then digits, no colon; same unified grammar as
+    # --contact_residues / --motif_residues), 1-indexed within each target
+    # chain, range-aware: "B50-70 B95 C1-10". The two selections are INDEPENDENT:
     #   i_con_target_residues -> restricts the inter-chain CONTACT loss target side
     #   i_pae_target_residues -> restricts the inter-chain PAE loss target side
     # A target chain absent from a given spec keeps its FULL sequence for that
-    # loss (so with chains B,C and i_con_target_residues="B:50-70 B:95", chain C
+    # loss (so with chains B,C and i_con_target_residues="B50-70 B95", chain C
     # is still fully contacted). None/empty => full sequence for every target
     # (legacy behavior, byte-identical). Intended for polymer targets (protein/
     # peptide/dna/rna), where 1 token == 1 residue; for small_molecule/metal
@@ -302,11 +312,27 @@ def boltz_hallucination(
     # term on/off rather than selecting residues.
     i_con_target_residues=None,
     i_pae_target_residues=None,
+    # Optional binder-SIDE residue selection for the inter-chain CONTACT loss
+    # (paratope targeting). Restricts WHICH BINDER residues are counted --
+    # e.g. "26-32 53-67 100-126" pins the paratope to a VHH's three CDRs so
+    # framework residues stop being rewarded for contacting the target. Bare
+    # 1-indexed positions within the binder chain (single chain by
+    # construction); mirrors --motif_binder_positions' grammar (space-
+    # separated tokens, each a single residue or a range; no chain prefix --
+    # binder is always `binder_chain`). None/empty => full binder (legacy
+    # behavior, byte-identical). Applies to i_con ONLY -- i_pae, target_plddt,
+    # motif, and the inter-target losses still see the full binder, matching
+    # the user-requested surface. When set alongside
+    # `optimize_contact_per_binder_pos=True`, `num_optimizing_binder_pos`
+    # (and its annealed schedule) is clamped to the paratope size so the
+    # curriculum can't silently saturate on a CDR set smaller than the ramp.
+    i_con_binder_residues=None,
     # Auxiliary INTER-TARGET losses: optimize contacts / interface-PAE BETWEEN
     # two target chains (not the binder). Each entry is a pair-string
     # "<sideA> | <sideB>" (also "<sideA> and <sideB>"), where each side is one or
-    # more CHAIN:RESNUM / CHAIN:start-end selections (comma/space separated) and
-    # both sides are target chains, e.g. "B:45-47 | C:52" or "B:103 | D:82-91,D:98".
+    # more CHAIN+RESNUM / CHAIN+start-end selections (letters then digits, no
+    # colon; comma/space separated) and both sides are target chains, e.g.
+    # "B45-47 | C52" or "B103 | D82-91,D98".
     # Computed with the SAME get_con_loss / get_pae_loss machinery as the
     # binder<->target i_con/i_pae (the two target-residue selections become
     # mask_1d / mask_1b). The two specs are independent; None/empty => no
@@ -363,6 +389,22 @@ def boltz_hallucination(
     motif_residues=None,
     motif_binder_positions=None,
     fix_motif_seq=True,
+    # Explicit sequence pinning, INDEPENDENT of the motif machinery (--fix_seq_
+    # positions / --fix_seq). No reference PDB and no geometry loss -- just a
+    # 1-to-1 (binder position -> amino acid) map that is written into res_type
+    # as a constant every step. Use it to hard-code residues the design must
+    # carry (a catalytic Cys, an engineered salt bridge, a fixed framework
+    # motif) without also constraining their geometry.
+    #   fix_seq_positions: 1-indexed binder positions, comma-separated with
+    #     inclusive ranges allowed -- "35,67-70" (parse_residue_spec grammar,
+    #     same as --motif_binder_positions / --i_con_binder_residues).
+    #   fix_seq: the amino acids, one letter per selected position IN ORDER --
+    #     "EGKDF" (whitespace/commas between groups are ignored, so the CLI's
+    #     "--fix_seq E GKDF" arrives here as "E,GKDF" or "EGKDF" alike).
+    # Both must be given together and their counts must match 1-to-1. Empty
+    # (default) => inactive, byte-identical to pre-feature runs.
+    fix_seq_positions='',
+    fix_seq='',
     # Sliding-window motif scaffolding (--motif_unindex_residues). Islands of
     # fixed intra-island gap structure (e.g. "A38,3,A42,A170" = island1 [A38,
     # A42 separated by 3 free residues], island2 [A170]) whose absolute binder
@@ -439,6 +481,33 @@ def boltz_hallucination(
     # final con/i_con/helix loss values compare across differently-tuned runs.
     # None => compute_final_metrics falls back to canonical defaults.
     metric_config=None,
+    # Local strand-propensity loss (--strand_residues). Chain-relative 1-indexed
+    # binder positions (e.g. "1-10,25-32"; parsed by parse_residue_spec) to bias
+    # toward extended Cbeta geometry via _get_strand_loss (i,i+2 far). Empty
+    # string => off; loss is computed but weighted 0 in that case. Weight comes
+    # via loss_scales['strand_loss'] (default 0.0).
+    strand_residues='',
+    strand_loss_offset=2,
+    strand_loss_floor=6.5,
+    # Tier-1 unsupervised strand-strand pairing loss: an intra-binder get_con_loss
+    # retuned to strand-pairing distance/seqsep. seqsep=5 forces long-range
+    # partners (rules out helix/turn contacts). Cutoff ~5.5 A targets Cbeta
+    # strand-partner spacing. num=1 = one closest partner per binder residue.
+    # Fully unsupervised (no strand identities); complements the intra-contact
+    # loss without replacing it. Weight via loss_scales['sheet_pair_loss'] (0=off).
+    sheet_pair_cutoff=5.5,
+    sheet_pair_seqsep=5,
+    sheet_pair_num=1,
+    # Region-scoped helix-loss EXCLUSION mask (--helix_residues). Chain-relative
+    # 1-indexed binder positions where the anti-helix bias should NOT apply --
+    # e.g. "26-32 100-126" lets a VHH's CDR1/CDR3 form helices without penalty
+    # while the rest of the binder still gets the global negative bias. Empty
+    # => full-binder mask (byte-identical to the pre-feature behavior). Note
+    # the polarity is INVERTED vs. --strand_residues (an INCLUDE mask): the
+    # user-facing intent is symmetric ("residues where I WANT this SS type"),
+    # but helix-loss is applied with a negative weight (a penalty), so
+    # "let it form here" means "drop the penalty here" => zero the mask.
+    helix_exclude_residues='',
 ):
 
     # Sampler profile for the gradient design epochs. Installed on the model now
@@ -597,6 +666,66 @@ def boltz_hallucination(
     chain_mask = (batch['entity_id'] == chain_to_number[binder_chain]).int()
     mid_points = torch.linspace(2, 22, 64).to(device)
 
+    # --- Local strand-propensity mask (--strand_residues) ------------------
+    # 1D binder-token mask; 1 on binder residues the user wants biased toward
+    # extended (beta-strand-like) backbone geometry. Broadcast to 2D at use
+    # time via strand_mask_1d[:,:,None] * strand_mask_1d[:,None,:] so the
+    # (i, i+2) diagonal is only taken over user-selected residues. Empty
+    # --strand_residues => None; loss is skipped (no _get_strand_loss call).
+    strand_mask_1d = None
+    strand_mask_2d = None
+    if strand_residues:
+        _sr = parse_residue_spec(strand_residues)  # 1-indexed within binder
+        if _sr:
+            binder_tok = torch.where(
+                batch['entity_id'][0] == chain_to_number[binder_chain])[0]
+            L_binder = binder_tok.numel()
+            _sr = [p for p in _sr if 1 <= p <= L_binder]
+            if _sr:
+                sel_tokens = binder_tok[torch.tensor(_sr, device=device) - 1]
+                strand_mask_1d = torch.zeros_like(chain_mask)
+                strand_mask_1d[0, sel_tokens] = 1
+                strand_mask_2d = strand_mask_1d[:, :, None] * strand_mask_1d[:, None, :]
+            else:
+                print(f"[strand] --strand_residues {strand_residues!r} "
+                      f"resolved to nothing in a {L_binder}-residue binder; "
+                      f"strand loss disabled for this run.")
+
+    # --- Helix-loss EXCLUSION mask (--helix_residues) ----------------------
+    # Global anti-helix bias by default; residues named here are ZEROED in the
+    # 2D mask so the loss ignores them (helices can form there without
+    # penalty). Polarity inverted vs. --strand_residues: user-facing meaning
+    # is "residues where I WANT this SS type", implemented as an INCLUDE for
+    # strand (positive-weighted loss pushes those residues TOWARD extended)
+    # and an EXCLUDE for helix (negative-weighted loss no longer PENALIZES
+    # those residues). Empty --helix_residues => full-binder mask (rebuilt on
+    # the fly at the call site), byte-identical to the pre-feature behavior.
+    helix_exclude_positions = None       # list[int] (1-indexed within binder)
+    helix_mask_2d = None                 # pre-built [B, L, L] when active
+    if helix_exclude_residues:
+        _hr = parse_residue_spec(helix_exclude_residues)
+        if _hr:
+            binder_tok = torch.where(
+                batch['entity_id'][0] == chain_to_number[binder_chain])[0]
+            L_binder = binder_tok.numel()
+            _hr = [p for p in _hr if 1 <= p <= L_binder]
+            if _hr:
+                helix_exclude_positions = _hr
+                excl_tokens = binder_tok[torch.tensor(_hr, device=device) - 1]
+                # Base = full binder mask (same as legacy `mask_2d` build);
+                # zero out excluded rows AND cols so any pair touching an
+                # excluded residue drops out of the helix bias.
+                _cm_1d = chain_mask.clone()
+                _cm_1d[0, excl_tokens] = 0
+                helix_mask_2d = _cm_1d[:, :, None] * _cm_1d[:, None, :]
+                print(f"[helix] --helix_residues {helix_exclude_residues!r} "
+                      f"excludes {len(_hr)}/{L_binder} binder residue(s) "
+                      f"from the anti-helix bias: {sorted(set(_hr))}")
+            else:
+                print(f"[helix] --helix_residues {helix_exclude_residues!r} "
+                      f"resolved to nothing in a {L_binder}-residue binder; "
+                      f"exclusion inactive.")
+
     # ---- Per-target masks and per-target settings -------------------------
     # target_chain_ids is supplied by the caller (boltzdesign.py) in
     # --target_types order; if absent (legacy single-target call), derive it
@@ -646,34 +775,27 @@ def boltz_hallucination(
     def _chain_token_positions(c):
         return torch.where(batch['entity_id'][0] == chain_to_number[c])[0]
 
-    def _parse_residue_selection(spec):
-        """'B:50-70 B:95 C:1-10' (also comma/semicolon separated) ->
-        {chain: set(1-indexed resnums)}. Empty/None -> {}."""
-        import re
+    def _parse_residue_selection(spec, flag='--i_con_target_residues'):
+        """'B50-70 B95 C1-10' (also comma/semicolon separated) ->
+        {chain: set(1-indexed resnums)}. Empty/None -> {}.
+
+        Thin wrapper over the unified `parse_chain_residues`. The target/pair
+        family (i_con/i_pae, inter-target-pair sides) shares the motif family's
+        chain+resnum grammar but WITHOUT the ':ATOMS' clause -- pass
+        allow_atom_suffix=False so the unified parser hard-rejects the
+        pre-migration 'B:50' form with a clear "use `B50`" hint.
+        """
         sel = {}
-        if not spec:
-            return sel
-        for tok in (t for t in re.split(r'[\s,;]+', str(spec).strip()) if t):
-            if ':' not in tok:
-                raise ValueError(
-                    f"residue selection token {tok!r} must be CHAIN:RESNUM "
-                    f"or CHAIN:start-end (e.g. B:95 or B:50-70)")
-            ch, rng = tok.split(':', 1)
-            ch = ch.strip()
-            if '-' in rng:
-                lo, hi = (int(x) for x in rng.split('-', 1))
-                lo, hi = min(lo, hi), max(lo, hi)
-                rs = range(lo, hi + 1)
-            else:
-                rs = [int(rng)]
-            sel.setdefault(ch, set()).update(rs)
+        for chain, resnum, _atoms in parse_chain_residues(
+                spec, allow_atom_suffix=False, flag=flag):
+            sel.setdefault(chain, set()).add(resnum)
         return sel
 
     def _build_restricted_masks(spec, label):
         """Per-target list of token masks: the full target mask for any chain
         absent from `spec`, else that chain's mask zeroed outside the selected
         residues. Mirrors target_masks shape/dtype/device exactly."""
-        sel = _parse_residue_selection(spec)
+        sel = _parse_residue_selection(spec, flag=f'--{label}')
         unknown = set(sel) - set(target_chain_ids)
         if unknown:
             raise ValueError(
@@ -705,11 +827,44 @@ def boltz_hallucination(
     i_pae_target_masks = _build_restricted_masks(
         i_pae_target_residues, 'i_pae_target_residues')
 
+    # ---- Binder-side i_con residue selection (paratope targeting) ------------
+    # Single 1D token mask (chain_mask & binder-residue selection). Bare
+    # 1-indexed positions within the binder chain (single chain by
+    # construction), same grammar as --motif_binder_positions -- no chain
+    # prefix. None/empty => full binder (== chain_mask; the substitution below
+    # becomes a no-op, byte-identical to the pre-feature call site).
+    if i_con_binder_residues:
+        _binder_res = parse_residue_spec(i_con_binder_residues)
+        _binder_positions = _chain_token_positions(binder_chain)
+        _L_binder = int(_binder_positions.numel())
+        _chosen = []
+        for _r in _binder_res:
+            if not (1 <= _r <= _L_binder):
+                raise ValueError(
+                    f"i_con_binder_residues: binder residue {_r} out of range "
+                    f"[1, {_L_binder}] (binder chain '{binder_chain}' has "
+                    f"{_L_binder} token(s))")
+            _chosen.append(_binder_positions[_r - 1])
+        i_con_binder_mask = torch.zeros_like(chain_mask)
+        if _chosen:
+            i_con_binder_mask[0, torch.stack(_chosen)] = 1
+        i_con_binder_count = int(i_con_binder_mask.sum().item())
+        print(f"[inter-mask] i_con_binder_residues: chain {binder_chain} "
+              f"restricted to {i_con_binder_count}/{_L_binder} residues "
+              f"{sorted(set(_binder_res))}")
+    else:
+        # Full binder: `& chain_mask` is a no-op, and the n_pos clamp below
+        # picks up the full binder length so the annealing schedule behaves
+        # exactly as before.
+        i_con_binder_mask = chain_mask
+        i_con_binder_count = int(chain_mask.sum().item())
+
     # ---- Inter-target residue-pair masks (auxiliary cross-target losses) ------
     # Optimize contacts / interface-PAE BETWEEN two target chains (never the
     # binder). Each pair is "<sideA> | <sideB>" (also "<sideA> and <sideB>" /
-    # "<sideA> vs <sideB>"); each side is one or more CHAIN:RESNUM /
-    # CHAIN:start-end selections (comma/space separated). Both sides must be
+    # "<sideA> vs <sideB>"); each side is one or more CHAIN+RESNUM /
+    # CHAIN+start-end selections (comma/space separated; no colon between
+    # chain and resnum). Both sides must be
     # TARGET chains. We reuse the SAME residue->token resolution as the epitope
     # masks above, then hand the two side-masks to the unchanged get_con_loss /
     # get_pae_loss as mask_1d / mask_1b, so the math is identical to i_con/i_pae.
@@ -753,10 +908,12 @@ def boltz_hallucination(
             if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
                 raise ValueError(
                     f"{label}: pair {raw!r} must have two sides separated by "
-                    f"'|' (or 'and'/'vs'), e.g. 'B:45-47 | C:52'")
-            mA = _selection_to_mask(_parse_residue_selection(parts[0]),
+                    f"'|' (or 'and'/'vs'), e.g. 'B45-47 | C52'")
+            mA = _selection_to_mask(_parse_residue_selection(
+                                        parts[0], flag=f'--{label} (sideA)'),
                                     f"{label} sideA of {raw!r}")
-            mB = _selection_to_mask(_parse_residue_selection(parts[1]),
+            mB = _selection_to_mask(_parse_residue_selection(
+                                        parts[1], flag=f'--{label} (sideB)'),
                                     f"{label} sideB of {raw!r}")
             desc = f"{parts[0].strip()} | {parts[1].strip()}"
             out.append((mA, mB, desc))
@@ -1110,13 +1267,10 @@ def boltz_hallucination(
             combined_ref_xyz, device=device)
         motif_onehot = torch.zeros(M, V, device=device, dtype=batch['res_type'].dtype)
 
-        # res_type column for each one-letter AA, matching the alphabet used
-        # throughout boltz_hallucination: list('XXARNDCQEGHILKMFPSTWYV-').
-        _ALPHABET = list('XXARNDCQEGHILKMFPSTWYV-')
-        _AA_TO_COL = {aa: i for i, aa in enumerate(_ALPHABET) if i >= 2 and aa not in ('X', '-')}
-
+        # res_type column for each one-letter AA (module-level map, shared with
+        # the --fix_seq pin below).
         for j, aa in enumerate(motif_seq):
-            col = _AA_TO_COL.get(aa)
+            col = _AA_TO_RES_TYPE_COL.get(aa)
             if col is None:
                 continue
             motif_onehot[j, col] = 1.0
@@ -1595,7 +1749,7 @@ def boltz_hallucination(
                   f"chain(s) {','.join(_motif_chains)} "
                   f"({','.join(f'{c}{r}' for c, r in m_chain_residues)}) "
                   f"-> binder positions {[p+1 for p in binder_pos]}; "
-                  f"seq={fixed_motif_seq}; fix_seq={bool(fix_motif_seq)}; "
+                  f"seq={fixed_motif_seq}; fix_motif_seq={bool(fix_motif_seq)}; "
                   f"atom_sel={'per-residue' if _any_sel else 'default(N,CA,C,CB / sidechain)'}; "
                   f"Kabsch-fit atoms={_K_total}")
         if motif_fape_active:
@@ -1621,7 +1775,7 @@ def boltz_hallucination(
                       + ("" if motif_slide_loss == 'distogram' else
                          "(coords determinant -> placement updates on full-mode "
                          "epochs only); ")
-                      + f"fix_seq={bool(fix_motif_seq)} (pin moves with state)")
+                      + f"fix_motif_seq={bool(fix_motif_seq)} (pin moves with state)")
             else:
                 print(f"[motif/slide] exhaustive triplet enumeration; "
                       f"determinant={motif_slide_loss}; beta 2 -> 20 over "
@@ -1629,7 +1783,105 @@ def boltz_hallucination(
                       + ("" if motif_slide_loss == 'distogram' else
                          "(coords determinant -> placement updates on full-mode "
                          "epochs only); ")
-                      + f"fix_seq={bool(fix_motif_seq)} (pin moves with state)")
+                      + f"fix_motif_seq={bool(fix_motif_seq)} (pin moves with state)")
+
+    # ---- Explicit sequence pin (--fix_seq_positions / --fix_seq) -----------
+    # A 1-to-1 (binder position -> amino acid) map, independent of the motif
+    # machinery: no reference PDB, no geometry loss. Mechanically identical to
+    # the motif sequence pin -- the selected res_type rows are overwritten with
+    # a constant one-hot every step (so the identity survives the soft/hard/omit
+    # machinery, including AAs like Cys that BoltzDesign1 otherwise excludes
+    # from design) and their res_type_logits grad is zeroed before norm_seq_grad
+    # so they neither move nor skew the normalization of the free positions.
+    # Both flags empty (default) => inactive, byte-identical to prior runs.
+    if bool(fix_seq_positions) != bool(fix_seq):
+        raise ValueError(
+            "--fix_seq_positions and --fix_seq must be given TOGETHER "
+            f"(got fix_seq_positions={fix_seq_positions!r}, fix_seq={fix_seq!r})")
+    fixseq_active = bool(fix_seq_positions) and bool(fix_seq)
+    fixseq_positions = []          # 0-indexed binder positions
+    fixseq_seq = ''                # one letter per entry of fixseq_positions
+    fixseq_token_idx = None        # LongTensor [P] token-axis indices
+    fixseq_row_mask = None         # [1, N, 1] 1.0 on pinned rows
+    fixseq_res_type_full = None    # [1, N, V] one-hot on pinned rows
+    if fixseq_active:
+        # parse_residue_spec splits on ',' only; normalize whitespace to commas
+        # first so a directly-passed "35 67-70" works as well as the CLI's
+        # comma-joined "35,67-70".
+        _fs_pos = parse_residue_spec(
+            ",".join(str(fix_seq_positions).replace(",", " ").split()))
+        if not _fs_pos:
+            raise ValueError(
+                f"--fix_seq_positions parsed to no positions (got "
+                f"{fix_seq_positions!r}); expected 1-indexed binder positions "
+                f"with optional ranges, e.g. '35,67-70'")
+        # The CLI joins its nargs tokens, so groups may arrive separated by
+        # whitespace or commas ("E GKDF" / "E,GKDF"); both mean "EGKDF".
+        fixseq_seq = ''.join(str(fix_seq).replace(',', ' ').split()).upper()
+        if len(fixseq_seq) != len(_fs_pos):
+            raise ValueError(
+                f"--fix_seq has {len(fixseq_seq)} amino acid(s) ({fixseq_seq!r}) "
+                f"but --fix_seq_positions resolves to {len(_fs_pos)} position(s) "
+                f"({_fs_pos}); the mapping must be 1-to-1 and in order")
+        _bad_aa = sorted({a for a in fixseq_seq if a not in _AA_TO_RES_TYPE_COL})
+        if _bad_aa:
+            raise ValueError(
+                f"--fix_seq contains non-standard amino acid letter(s) {_bad_aa}; "
+                f"allowed: {''.join(sorted(_AA_TO_RES_TYPE_COL))}")
+        _fs_binder_positions = _chain_token_positions(binder_chain)
+        _fs_L = int(_fs_binder_positions.numel())
+        _dupes = sorted({p for p in _fs_pos if _fs_pos.count(p) > 1})
+        if _dupes:
+            raise ValueError(
+                f"--fix_seq_positions lists position(s) {_dupes} more than once; "
+                f"each position may be pinned to exactly one amino acid")
+        for _p in _fs_pos:
+            if not (1 <= _p <= _fs_L):
+                raise ValueError(
+                    f"--fix_seq_positions: binder position {_p} out of range "
+                    f"[1, {_fs_L}] (binder chain {binder_chain!r} has {_fs_L} "
+                    f"residue(s)); raise --length_min/--length_max")
+        fixseq_positions = [p - 1 for p in _fs_pos]
+
+        # Conflict with the motif sequence pin. Fixed motif positions are known
+        # up-front -> a real spec conflict, so fail loudly. Sliding motif
+        # positions are chosen per-epoch by the placement search, so an overlap
+        # can only be warned about; --fix_seq is applied AFTER the motif pin and
+        # therefore wins on any position it names.
+        if motif_active and fix_motif_seq:
+            _clash = sorted(fixed_positions & set(fixseq_positions))
+            if _clash:
+                raise ValueError(
+                    f"--fix_seq_positions {[p+1 for p in _clash]} also carry the "
+                    f"pinned motif (--motif_residues + --fix_motif_seq True). "
+                    f"Drop them from --fix_seq_positions, or set "
+                    f"--fix_motif_seq False if --fix_seq should own the sequence.")
+            if motif_slide_active:
+                print("[fix_seq] NOTE: a sliding motif (--motif_unindex_residues) "
+                      "is active; if the placement search lands a motif residue "
+                      "on a --fix_seq position, --fix_seq wins (it is applied "
+                      "after the motif pin) and that motif residue's identity "
+                      "will not be retained.")
+
+        _fs_N = batch['res_type'].shape[1]
+        _fs_V = batch['res_type'].shape[-1]
+        fixseq_token_idx = torch.as_tensor(
+            [int(_fs_binder_positions[p]) for p in fixseq_positions],
+            dtype=torch.long, device=device)
+        fixseq_row_mask = torch.zeros(1, _fs_N, 1, device=device,
+                                      dtype=batch['res_type'].dtype)
+        fixseq_res_type_full = torch.zeros(1, _fs_N, _fs_V, device=device,
+                                           dtype=batch['res_type'].dtype)
+        for _j, _tok in enumerate(fixseq_token_idx.tolist()):
+            fixseq_row_mask[0, _tok, 0] = 1.0
+            fixseq_res_type_full[0, _tok, _AA_TO_RES_TYPE_COL[fixseq_seq[_j]]] = 1.0
+
+        print(f"[fix_seq] pinning {len(fixseq_positions)} binder position(s): "
+              + ", ".join(f"{binder_chain}{p+1}={a}"
+                          for p, a in zip(fixseq_positions, fixseq_seq)))
+        print("[fix_seq] the pin holds through the design loop and the "
+              "semi-greedy stage; the downstream LigandMPNN/ProteinMPNN "
+              "redesign is a separate stage and does NOT see it.")
 
     # ---- Explicit atom-pair distance restraints (--atom_pairs) -------------
     # Resolved once here (binder length fixed -> stable target indices); the
@@ -1873,40 +2125,82 @@ def boltz_hallucination(
                 # named in --i_con_target_residues). It is mask_1d in the standard
                 # (per-target-residue) branch and mask_1b in the per-binder-pos
                 # branch, so a single substitution covers both.
+                # Paratope targeting (--i_con_binder_residues): mirror substitution
+                # on the BINDER side. i_con_binder_mask == chain_mask when the
+                # flag is unset, so both call sites stay byte-identical then.
                 t_mask = i_con_target_masks[ti]
+                b_mask = i_con_binder_mask
                 if optimize_contact_per_binder_pos_pt[ti]:
                     # Per-binder-position contact objective (count from the binder
-                    # side: mask_1d=chain_mask). num_pos selects how many binder
+                    # side: mask_1d=binder). num_pos selects how many binder
                     # positions must contact this target. Faithful to the original
                     # boltz_hallucination: a FINITE num_pos (the annealed schedule)
                     # is used ONLY when increasing_contact_over_itr is on; otherwise
                     # num_pos stays inf so every binder position counts. Note
                     # increasing_contact_over_itr and num_optimizing_binder_pos are
                     # GLOBAL (not per-target) -- only the optimize flag is per-target.
+                    # Clamp n_pos to the paratope size when the binder mask is
+                    # restricted (i_con_binder_residues set) so the ramp target
+                    # can't silently saturate on a CDR set smaller than the
+                    # scheduled count -- otherwise the outer min_k averages over
+                    # k_mask.sum() == paratope_size positions regardless of n_pos
+                    # and the "grow the contact footprint" curriculum is dead.
                     if increasing_contact_over_itr:
                         n_pos = 0 if pre_run else num_optimizing_binder_pos
                     else:
                         n_pos = float("inf")
+                    if n_pos != float("inf"):
+                        n_pos = min(int(n_pos), i_con_binder_count)
                     li = get_con_loss(pdist, mid_pts,
                                       num=num_inter_contacts_pt[ti], seqsep=0,
                                       num_pos=n_pos,
                                       cutoff=inter_chain_cutoff_pt[ti], binary=False,
-                                      mask_1d=chain_mask, mask_1b=t_mask)
+                                      mask_1d=b_mask, mask_1b=t_mask)
                 else:
                     li = get_con_loss(pdist, mid_pts,
                                       num=num_inter_contacts_pt[ti], seqsep=0,
                                       cutoff=inter_chain_cutoff_pt[ti], binary=False,
-                                      mask_1d=t_mask, mask_1b=chain_mask)
+                                      mask_1d=t_mask, mask_1b=b_mask)
                 i_con_loss = i_con_loss + w * li
                 i_con_any = True
 
-            mask_2d = chain_mask[:, :, None] * chain_mask[:, None, :]
+            # Helix loss mask: full binder by default (--helix_residues unset,
+            # legacy behavior byte-identical), else the pre-built exclusion
+            # mask that zeroes out user-selected residues so helices can form
+            # at those positions without penalty.
+            if helix_mask_2d is not None:
+                mask_2d = helix_mask_2d
+            else:
+                mask_2d = chain_mask[:, :, None] * chain_mask[:, None, :]
             helix_loss = _get_helix_loss(pdist, mid_pts,
                                     offset=None, mask_2d=mask_2d, binary=True)
 
             losses = {'con_loss': con_loss, 'helix_loss': helix_loss}
             if i_con_any:
                 losses['i_con_loss'] = i_con_loss
+
+            # Local strand-propensity loss (--strand_residues): (i, i+offset)
+            # far-diagonal on the pseudo-Cbeta distogram over user-selected
+            # binder residues. Direct mirror of the helix loss with the
+            # `far` primitive; masked to strand_mask_2d built at setup.
+            if strand_mask_2d is not None:
+                losses['strand_loss'] = _get_strand_loss(
+                    pdist, mid_pts,
+                    diag_offset=strand_loss_offset,
+                    floor=strand_loss_floor,
+                    mask_2d=strand_mask_2d, binary=True)
+
+            # Tier-1 unsupervised strand-strand pairing loss: intra-binder
+            # get_con_loss retuned for strand-partner spacing. seqsep gates
+            # OUT the helix/turn window so satisfying it requires long-range
+            # partners -- which Boltz's PDB-trained trunk overwhelmingly
+            # resolves as beta pairing. Fully unsupervised: no strand
+            # identities or registers supplied. Weight 0 (default) -> off.
+            losses['sheet_pair_loss'] = get_con_loss(
+                pdist, mid_pts,
+                num=sheet_pair_num, seqsep=sheet_pair_seqsep,
+                cutoff=sheet_pair_cutoff, binary=False,
+                mask_1d=chain_mask, mask_1b=chain_mask)
 
             # Auxiliary INTER-TARGET contact loss: optimize contacts BETWEEN two
             # target chains. Each pair reuses the exact get_con_loss term as the
@@ -2109,6 +2403,8 @@ def boltz_hallucination(
                     'atom_pair_distogram_loss': 1.0,
                     'atom_pair_coords_loss': 1.0,
                     'atom_angle_coords_loss': 1.0,
+                    'strand_loss': 0.0,
+                    'sheet_pair_loss': 0.0,
                 }
 
             # Defensive: these keys may be present in `losses` while a
@@ -2120,6 +2416,12 @@ def boltz_hallucination(
                        'inter_target_con_loss', 'inter_target_pae_loss'):
                 if _k in losses and _k not in loss_scales:
                     loss_scales = {**loss_scales, _k: 1.0}
+            # strand/sheet-pair defaults are 0.0 (opt-in), so an old config
+            # that doesn't mention them keeps the pre-feature behavior even
+            # though sheet_pair_loss is always computed & inserted in losses.
+            for _k in ('strand_loss', 'sheet_pair_loss'):
+                if _k in losses and _k not in loss_scales:
+                    loss_scales = {**loss_scales, _k: 0.0}
 
             # Calculate total loss and print individual losses
             total_loss = sum(loss * loss_scales[name] for name, loss in losses.items())
@@ -2175,6 +2477,15 @@ def boltz_hallucination(
                 if motif_slide_active:
                     _last_pin_slide_state[0] = list(slide_state)
 
+            # Explicit sequence pin (--fix_seq_positions / --fix_seq). Same
+            # constant-write trick, applied AFTER the motif pin so a position
+            # named by both ends up at the user's explicitly requested identity
+            # (only reachable with a sliding motif -- a fixed-motif overlap is
+            # rejected at setup).
+            if fixseq_active:
+                batch['res_type'] = (batch['res_type'] * (1 - fixseq_row_mask)
+                                     + fixseq_res_type_full)
+
             if non_protein_target:
                 batch['msa'] = batch['res_type'].unsqueeze(0).to(device).detach()
                 batch['profile'] = batch['msa'].float().mean(dim=0).to(device).detach()
@@ -2190,6 +2501,12 @@ def boltz_hallucination(
         opt = {}
         traj_coords_list = []
         traj_plddt_list = []
+        # --- per-stage diagnostics (mirrors mosaic design_stages) ------------
+        _bmask = batch['entity_id'] == chain_to_number[binder_chain]
+        _seq_at_start = torch.argmax(batch['res_type'][_bmask, :], dim=-1).detach().cpu().numpy().copy()
+        _dg = {"first_v": None, "last_v": None, "best_v": float("inf"),
+               "gnorms": [], "first_fed": None, "last_fed": None,
+               "first_lr": None, "last_lr": None}
         for i in range(iters):
             for k,(s,e) in m.items():
                 if k == "temp":
@@ -2208,6 +2525,12 @@ def boltz_hallucination(
             opt["lr_rate"] = learning_rate * lr_scale
                 
             batch = update_sequence(opt, batch, mask, non_protein_target=non_protein_target, binder_chain=binder_chain)
+            with torch.no_grad():
+                _fed = batch['res_type'][_bmask, :]
+                _fed_stat = (float(_fed.sum(-1).mean()), float(_fed.min()))
+                if _dg["first_fed"] is None:
+                    _dg["first_fed"] = _fed_stat
+                _dg["last_fed"] = _fed_stat
             total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt = get_model_loss(batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run, distogram_only, predict_args, loss_scales, binder_chain, increasing_contact_over_itr, num_intra_contacts=num_intra_contacts, num_optimizing_binder_pos=num_optimizing_binder_pos, intra_chain_cutoff=intra_chain_cutoff, save_trajectory = save_trajectory, epoch_idx=i, stage_name=stage_name)
             traj_coords_list.append(traj_coords)
             traj_plddt_list.append(traj_plddt)
@@ -2225,11 +2548,45 @@ def boltz_hallucination(
                 # normalization of the free (designed) positions.
                 if motif_active and fix_motif_seq:
                     batch['res_type_logits'].grad[0, motif_token_idx, :] = 0
+                # Same freeze for the explicitly pinned --fix_seq positions.
+                if fixseq_active:
+                    batch['res_type_logits'].grad[0, fixseq_token_idx, :] = 0
+                # BEFORE norm_seq_grad: afterwards every step has the same norm by
+                # construction, so the raw value is the only signal that the loss
+                # surface has gone flat.
+                _dg["gnorms"].append(float(batch['res_type_logits'].grad.norm()))
                 batch['res_type_logits'].grad = norm_seq_grad(batch['res_type_logits'].grad, chain_mask)
                 optimizer.step()
                 optimizer.zero_grad()
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"Epoch {i}: lr: {current_lr:.3f}, soft: {opt['soft']:.2f}, hard: {opt['hard']:.2f}, temp: {opt['temp']:.2f}, total loss: {total_loss.item():.2f}, {loss_str}")
+                _tl = float(total_loss.item())
+                if _dg["first_v"] is None:
+                    _dg["first_v"] = _tl
+                    _dg["first_lr"] = current_lr
+                _dg["last_v"] = _tl
+                _dg["last_lr"] = current_lr
+                _dg["best_v"] = min(_dg["best_v"], _tl)
+
+        if iters > 0 and _dg["first_v"] is not None:
+            with torch.no_grad():
+                _seq_now = torch.argmax(batch['res_type'][_bmask, :], dim=-1).detach().cpu().numpy()
+                _n_flipped = int((_seq_now != _seq_at_start).sum())
+                _lg = batch['res_type_logits'][_bmask, :]
+                _p = torch.softmax(_lg, dim=-1)
+                _ent = float(-(torch.log_softmax(_lg, dim=-1) * _p).sum(-1).mean())
+            print(f"  [summary {stage_name}] loss {_dg['first_v']:+.4f} -> {_dg['last_v']:+.4f} "
+                  f"(best {_dg['best_v']:+.4f})")
+            print(f"  [summary {stage_name}] argmax changed at {_n_flipped}/{len(_seq_now)} "
+                  f"positions   entropy {_ent:.4f}   eff_lr {_dg['first_lr']:.2e} -> {_dg['last_lr']:.2e}")
+            if _dg["gnorms"]:
+                print(f"  [summary {stage_name}] raw |grad| first {_dg['gnorms'][0]:.3e}  "
+                      f"last {_dg['gnorms'][-1]:.3e}  mean {float(np.mean(_dg['gnorms'])):.3e}")
+            if _dg["first_fed"] and _dg["last_fed"]:
+                print(f"  [summary {stage_name}] model input rowsum "
+                      f"{_dg['first_fed'][0]:.4f} -> {_dg['last_fed'][0]:.4f}   "
+                      f"min {_dg['first_fed'][1]:+.4f} -> {_dg['last_fed'][1]:+.4f}   "
+                      f"(1.0 / >=0 = on the simplex)")
 
         # Snapshot the last-epoch argmax sequence for this stage; outer block
         # re-folds at stock sampler and writes {stage}_last.pdb. Only stages
@@ -2368,26 +2725,32 @@ def boltz_hallucination(
     final_sampler = SamplerConfig(write_full_pae=True)
     final_predict_args = apply_sampler_config(boltz_model, final_sampler)
 
-    # Binder positions occupied by the pinned motif (final, pin-consistent state).
-    # Semi-greedy accepts mutations on iPTM alone -- it never sees the motif loss
-    # -- so without this guard it could silently mutate a pinned motif residue.
-    _motif_binder_pos_arr = None
+    # Binder positions whose sequence is pinned: the motif pin (final,
+    # pin-consistent state) plus the explicit --fix_seq positions. Semi-greedy
+    # accepts mutations on iPTM alone -- it never sees the motif loss, and no
+    # loss term knows about --fix_seq at all -- so without this guard it could
+    # silently mutate a pinned residue.
+    _frozen_binder_pos_arr = None
+    _fbp = []
     if motif_active and fix_motif_seq:
-        _mbp = list(binder_pos) if motif_fixed_active else []
+        _fbp += list(binder_pos) if motif_fixed_active else []
         if motif_slide_active:
             _mstate = (_last_pin_slide_state[0]
                        if _last_pin_slide_state[0] is not None else slide_state)
-            _mbp += list(_placement_to_positions(_mstate, slide_islands))
-        _motif_binder_pos_arr = np.array(sorted(set(_mbp)), dtype=int)
+            _fbp += list(_placement_to_positions(_mstate, slide_islands))
+    if fixseq_active:
+        _fbp += list(fixseq_positions)
+    if _fbp:
+        _frozen_binder_pos_arr = np.array(sorted(set(_fbp)), dtype=int)
 
     def _mutate(sequence, best_logits, i_prob):
         mutated_sequence = list(sequence) # Create a copy of the input tensor
         i_prob = np.array(i_prob, dtype=float)
-        if _motif_binder_pos_arr is not None and _motif_binder_pos_arr.size:
-            i_prob[_motif_binder_pos_arr] = 0.0   # never mutate pinned motif residues
+        if _frozen_binder_pos_arr is not None and _frozen_binder_pos_arr.size:
+            i_prob[_frozen_binder_pos_arr] = 0.0  # never mutate pinned residues
             if i_prob.sum() <= 0:                 # degenerate: spread over the rest
                 i_prob = np.ones(length, dtype=float)
-                i_prob[_motif_binder_pos_arr] = 0.0
+                i_prob[_frozen_binder_pos_arr] = 0.0
         i = np.random.choice(np.arange(length),p=i_prob/i_prob.sum())
         i_logits = best_logits[:, i]
         i_logits = i_logits - torch.max(i_logits)
@@ -2487,13 +2850,15 @@ def boltz_hallucination(
                     target_chain_ids=list(target_chain_ids or []), length=length,
                     atom_pairs=atom_pairs, atom_angles=atom_angles,
                     com_loss_weight=com_loss_weight, pdb_path=pdb_path,
-                    metric_config=metric_config)
+                    metric_config=metric_config,
+                    helix_exclude_positions=helix_exclude_positions)
             if out_apo is not None:
                 result['apo'] = compute_final_metrics(
                     boltz_model, out_apo, bb_apo, bs_apo,
                     binder_chain=binder_chain, target_chain_ids=[], length=length,
                     atom_pairs=None, atom_angles=None, com_loss_weight=0.0,
-                    pdb_path='', metric_config=metric_config)
+                    pdb_path='', metric_config=metric_config,
+                    helix_exclude_positions=helix_exclude_positions)
         except Exception as e:
             print(f"[metrics] compute_final_metrics failed: {type(e).__name__}: {e}")
         return result or None
@@ -2644,6 +3009,7 @@ def run_boltz_design(
             'target_chain_ids': None,
             'i_con_target_residues': None,
             'i_pae_target_residues': None,
+            'i_con_binder_residues': None,
             'inter_target_con_pairs': [],
             'inter_target_pae_pairs': [],
             'inter_target_num_contacts': 2,
@@ -2656,6 +3022,25 @@ def run_boltz_design(
             'length_max': 160,
             'helix_loss_min': -0.6,
             'helix_loss_max': -0.2,
+            # Region-scoped helix-loss EXCLUSION mask (--helix_residues; kwarg
+            # name helix_exclude_residues). Empty => full-binder mask (legacy).
+            'helix_exclude_residues': '',
+            # Local strand-propensity loss (--strand_residues). Off by default.
+            'strand_residues': '',
+            'strand_loss_offset': 2,
+            'strand_loss_floor': 6.5,
+            'strand_loss_min': 0.0,
+            'strand_loss_max': 0.0,
+            # Tier-1 unsupervised strand-strand pairing loss (get_con_loss with
+            # strand-pairing cutoff/seqsep on the binder). Weight 0 => off.
+            'sheet_pair_cutoff': 5.5,
+            'sheet_pair_seqsep': 5,
+            'sheet_pair_num': 1,
+            'sheet_pair_loss': 0.0,
+            # Explicit sequence pin (--fix_seq_positions / --fix_seq). Both
+            # empty => off.
+            'fix_seq_positions': '',
+            'fix_seq': '',
             'optimizer_type': 'SGD',
         }
 
@@ -2695,8 +3080,11 @@ def run_boltz_design(
     alphabet = list('XXARNDCQEGHILKMFPSTWYV-')
     rmsd_csv_path = os.path.join(results_final_dir, 'rmsd_results.csv')
     csv_exists = os.path.exists(rmsd_csv_path)
-    filtered_config = {k: v for k, v in config.items() 
-                if k not in ['helix_loss_min', 'helix_loss_max', 'length_min', 'length_max']}
+    filtered_config = {k: v for k, v in config.items()
+                if k not in ['helix_loss_min', 'helix_loss_max',
+                             'length_min', 'length_max',
+                             'strand_loss_min', 'strand_loss_max',
+                             'sheet_pair_loss']}
     for yaml_path in Path(yaml_dir).glob('*.yaml'):
         if yaml_path.name.endswith('.yaml'):
                 target_binder_input = yaml_path.stem
@@ -2704,6 +3092,16 @@ def run_boltz_design(
                     config['length'] = random.randint(config['length_min'],config['length_max'])
                     filtered_config['length'] = config['length']
                     loss_scales['helix_loss'] = random.uniform(config['helix_loss_min'], config['helix_loss_max'])
+                    # Strand loss weight: per-iter uniform sample, mirrors the
+                    # helix_loss min/max pattern. Defaults 0/0 => always 0 => off.
+                    loss_scales['strand_loss'] = random.uniform(
+                        config.get('strand_loss_min', 0.0),
+                        config.get('strand_loss_max', 0.0))
+                    # Sheet-pair loss weight: a single scalar (unlike helix
+                    # which is a negative BIAS and worth annealing per-run,
+                    # sheet_pair_loss is a positive contact-style term with
+                    # no natural randomization).
+                    loss_scales['sheet_pair_loss'] = config.get('sheet_pair_loss', 0.0)
 
                     # Per-iteration intermediate-structure subdir keeps the
                     # per-epoch PDB names tidy: <root>/itr<N>_length<L>/<stage>_epoch<NNNN>.pdb

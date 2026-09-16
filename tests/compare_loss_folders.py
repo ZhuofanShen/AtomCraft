@@ -140,12 +140,52 @@ def quartiles(v):
     return v[0], v[0]
 
 
-def plot_compare(loss, folder_vals, out_png, ylabel=None):
-    """One figure: a box per folder (median/quartiles) + jittered itr points.
+VIOLIN_FACE = "#AEC7E8"
+VIOLIN_EDGE = "#4C72B0"
+POINT_FACE = "#DD8452"
+
+
+def draw_column(ax, pos, vals, rng, *, face=VIOLIN_FACE, edge=VIOLIN_EDGE,
+                point_color=POINT_FACE, width=0.7, show_points=True,
+                annotate_n=True, jitter=0.16):
+    """Draw ONE distribution at x=`pos`: violin + IQR bar + median tick + points.
+
+    Shared by the single-metric figures and the grouped panels so both look the
+    same. The violin is skipped for degenerate series (n < 2, or every value
+    identical) because the KDE is singular there -- the points and the IQR/median
+    marks still render, so a 1-design folder is drawn rather than crashing.
+    `rng` is a `random.Random` supplied by the caller so x-jitter is reproducible
+    across a whole figure.
+    """
+    if len(vals) >= 2 and len(set(vals)) > 1:
+        parts = ax.violinplot([vals], positions=[pos], widths=width,
+                              showmeans=False, showmedians=False, showextrema=False)
+        for body in parts["bodies"]:
+            body.set_facecolor(face)
+            body.set_edgecolor(edge)
+            body.set_alpha(0.65)
+            body.set_linewidth(1.2)
+    q1, med, q3 = np.percentile(vals, [25, 50, 75])
+    ax.vlines(pos, q1, q3, color="black", linewidth=4, zorder=3)
+    ax.hlines(med, pos - 0.12, pos + 0.12, color="white", linewidth=2.5, zorder=4)
+    # Points LAST (highest zorder) so individual designs stay visible on top of
+    # the violin body -- the whole point of overlaying them.
+    if show_points:
+        xs = [pos + rng.uniform(-jitter, jitter) for _ in vals]
+        ax.scatter(xs, vals, color=point_color, edgecolor="black", linewidth=0.3,
+                   s=22, alpha=0.85, zorder=5)
+    if annotate_n:
+        ax.annotate(f"n={len(vals)}", (pos, max(vals)), textcoords="offset points",
+                    xytext=(0, 6), ha="center", fontsize=8, color="black")
+
+
+def plot_compare(loss, folder_vals, out_png, ylabel=None, show_points=True):
+    """One figure: a violin per folder (median/IQR) + jittered per-design points.
 
     folder_vals: list of (label, [values]) in CLI order; folders with no data
     for this loss are dropped. `ylabel` overrides the default y-axis caption so
     non-loss callers (e.g. final-fold metrics) can label the axis correctly.
+    `show_points` turns the per-design scatter overlay off.
     """
     cols = [(lbl, v) for lbl, v in folder_vals if v]
     if not cols:
@@ -159,81 +199,13 @@ def plot_compare(loss, folder_vals, out_png, ylabel=None):
         print(f"[debug]   !! REPEATED bar label(s) {rep} -> a box is drawn twice "
               f"with the SAME data (x-jitter reseeded per box, so it looks different)")
 
+    # ONE axes for everything. (This used to call plt.subplots twice -- the
+    # scatter went onto the first figure, which was then overwritten by the
+    # second and never saved, so the points silently vanished from every PNG.)
     fig, ax = plt.subplots(figsize=(max(4.0, 1.9 * len(cols) + 1.0), 5.0))
-    # ax.boxplot(
-    #     data, positions=positions, widths=0.55, showfliers=False,
-    #     patch_artist=True,
-    #     boxprops=dict(facecolor="#AEC7E8", edgecolor="#4C72B0", linewidth=1.2),
-    #     medianprops=dict(color="black", linewidth=1.8),
-    #     whiskerprops=dict(color="#4C72B0", linewidth=1.2),
-    #     capprops=dict(color="#4C72B0", linewidth=1.2),
-    #     zorder=2)
     rng = random.Random(0)
     for i, v in enumerate(data):
-        xs = [i + rng.uniform(-0.16, 0.16) for _ in v]
-        ax.scatter(xs, v, color="#DD8452", edgecolor="black", linewidth=0.3,
-                   s=22, alpha=0.8, zorder=3)
-        # xs = [i + rng.uniform(-0.08, 0.08) for _ in v]
-        # ax.scatter(
-        #     xs,
-        #     v,
-        #     color="black",
-        #     s=10,
-        #     alpha=0.4,
-        #     zorder=5,
-        # )
-    fig, ax = plt.subplots(figsize=(max(4.0, 1.9 * len(cols) + 1.0), 5.0))
-
-    # Violin plots
-    parts = ax.violinplot(
-        data,
-        positions=positions,
-        widths=0.7,
-        showmeans=False,
-        showmedians=False,
-        showextrema=False,
-    )
-
-    # Style violins
-    for body in parts["bodies"]:
-        body.set_facecolor("#AEC7E8")
-        body.set_edgecolor("#4C72B0")
-        body.set_alpha(0.8)
-        body.set_linewidth(1.2)
-
-    # Add median + IQR overlay
-    for i, v in enumerate(data):
-        q1, med, q3 = np.percentile(v, [25, 50, 75])
-
-        # IQR bar
-        ax.vlines(
-            i, q1, q3,
-            color="black",
-            linewidth=4,
-            zorder=3
-        )
-
-        # Median line
-        ax.hlines(
-            med,
-            i - 0.12,
-            i + 0.12,
-            color="white",
-            linewidth=2.5,
-            zorder=4
-        )
-
-        ax.annotate(
-            f"n={len(v)}",
-            (i, max(v)),
-            textcoords="offset points",
-            xytext=(0, 6),
-            ha="center",
-            fontsize=8,
-            color="black",
-        )
-        ax.annotate(f"n={len(v)}", (i, max(v)), textcoords="offset points",
-                        xytext=(0, 6), ha="center", fontsize=8, color="black")
+        draw_column(ax, i, v, rng, show_points=show_points)
 
     ax.set_xticks(positions)
     ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9)
